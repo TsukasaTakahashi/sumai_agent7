@@ -11,6 +11,7 @@ export const SimpleChat: React.FC = () => {
   const [message, setMessage] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [sessionId, setSessionId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
@@ -35,16 +36,30 @@ export const SimpleChat: React.FC = () => {
       setIsLoading(true);
 
       try {
+        const requestBody = sessionId 
+          ? { message: userMessage, session_id: sessionId }
+          : { message: userMessage };
+          
+        console.log('Sending request:', requestBody);
+          
         const response = await fetch('http://127.0.0.1:8000/chat', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({ message: userMessage }),
+          body: JSON.stringify(requestBody),
         });
 
         if (response.ok) {
           const data = await response.json();
+          console.log('Received response:', data);
+          
+          // セッションIDを保存（初回のみ）
+          if (!sessionId) {
+            setSessionId(data.session_id);
+            console.log('Session ID saved:', data.session_id);
+          }
+          
           const aiMessage: Message = {
             id: data.message_id,
             role: 'assistant',
