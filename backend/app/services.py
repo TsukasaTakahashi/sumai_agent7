@@ -1,8 +1,12 @@
 import uuid
+import logging
 from datetime import datetime
 from typing import Dict, List, Optional
 from app.models import ChatSession, ChatMessage, MessageRole, AgentResponse
 from app.llm_service import llm_service
+from app.property_agent import property_analysis_agent
+
+logger = logging.getLogger(__name__)
 
 class ChatService:
     def __init__(self):
@@ -52,14 +56,44 @@ class AIAgentService:
         self.agents = {
             "property_search": self._property_search_agent,
             "recommendation": self._recommendation_agent,
+            "property_analysis": self._property_analysis_agent,
             "general": self._general_agent
         }
     
     async def route_message(self, message: str, session_id: str) -> AgentResponse:
-        # 簡単なルーティングロジック（後で改善）
+        # 高度なルーティングロジック
         message_lower = message.lower()
         
-        if any(keyword in message_lower for keyword in ["物件", "不動産", "検索", "探す"]):
+        # 複雑な価格・住所分析が必要な問い合わせを検出
+        analysis_keywords = [
+            "相場", "平均", "比較", "分析", "統計", "傾向", "トレンド",
+            "価格帯", "予算", "安い", "高い", "地域", "エリア", "都道府県",
+            "市", "区", "円以下", "円以上", "万円", "億円", "どのくらい",
+            "いくら", "範囲", "条件", "絞り込み", "詳細", "複数",
+            "件数", "登録", "データベース", "何件", "総数", "合計", "全体",
+            # 地域名キーワード（都道府県）
+            "北海道", "青森", "岩手", "宮城", "秋田", "山形", "福島",
+            "茨城", "栃木", "群馬", "埼玉", "千葉", "東京", "神奈川",
+            "新潟", "富山", "石川", "福井", "山梨", "長野", "岐阜",
+            "静岡", "愛知", "三重", "滋賀", "京都", "大阪", "兵庫",
+            "奈良", "和歌山", "鳥取", "島根", "岡山", "広島", "山口",
+            "徳島", "香川", "愛媛", "高知", "福岡", "佐賀", "長崎",
+            "熊本", "大分", "宮崎", "鹿児島", "沖縄",
+            # ひらがな地域名も含める（タイポ含む）
+            "かながわ", "かんがわ", "かんんがわ", "とうきょう", "おおさか", "あいち", "ふくおか"
+        ]
+        
+        # 複数の条件や複雑な分析が必要かチェック
+        complex_patterns = [
+            ("価格" in message_lower and any(loc in message_lower for loc in ["地域", "エリア", "都道府県", "市", "区"])),
+            any(keyword in message_lower for keyword in analysis_keywords),
+            ("と" in message_lower and ("価格" in message_lower or "住所" in message_lower)),
+            len([word for word in ["価格", "住所", "間取り", "築年数", "駅"] if word in message_lower]) >= 2
+        ]
+        
+        if any(complex_patterns):
+            return await self.agents["property_analysis"](message, session_id)
+        elif any(keyword in message_lower for keyword in ["物件", "不動産", "検索", "探す"]):
             return await self.agents["property_search"](message, session_id)
         elif any(keyword in message_lower for keyword in ["おすすめ", "推薦", "提案"]):
             return await self.agents["recommendation"](message, session_id)
@@ -120,6 +154,19 @@ class AIAgentService:
                 response="申し訳ございません。現在、推薦サービスに一時的な問題が発生しています。しばらく時間をおいて再度お試しください。",
                 confidence=0.3,
                 metadata={"agent_type": "recommendation", "llm_used": False, "fallback": True}
+            )
+    
+    async def _property_analysis_agent(self, message: str, session_id: str) -> AgentResponse:
+        """複雑な価格・住所分析エージェント"""
+        try:
+            return await property_analysis_agent.analyze_query(message, session_id)
+        except Exception as e:
+            logger.error(f"Property analysis agent error: {e}")
+            return AgentResponse(
+                agent_name="property_analysis",
+                response="申し訳ございません。物件分析中にエラーが発生しました。基本的な検索をお試しいただくか、もう一度お聞かせください。",
+                confidence=0.3,
+                metadata={"agent_type": "property_analysis", "llm_used": False, "fallback": True, "error": str(e)}
             )
     
     async def _general_agent(self, message: str, session_id: str) -> AgentResponse:

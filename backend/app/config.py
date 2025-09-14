@@ -8,11 +8,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # .env ファイルの読み込み（存在しなければ .env.example を使用）
-if os.path.exists(".env"):
-    env_file = ".env"
+# 絶対パスを使用して確実に読み込み
+base_dir = os.path.dirname(os.path.dirname(__file__))  # backend/
+env_path = os.path.join(base_dir, ".env")
+env_example_path = os.path.join(base_dir, ".env.example")
+
+if os.path.exists(env_path):
+    env_file = env_path
     logger.info("Using .env file")
 else:
-    env_file = ".env.example"
+    env_file = env_example_path
     logger.info(f"Using fallback config file: {env_file}")
 
 load_dotenv(env_file)

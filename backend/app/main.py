@@ -9,6 +9,7 @@ from app.models import (
     ErrorResponse, FileType
 )
 from app.services import chat_service, ai_agent_service, file_service
+from app.database import database_service
 
 # FastAPIインスタンス作成
 app = FastAPI(title="住まいエージェント API", version="1.0.0")
@@ -127,6 +128,97 @@ async def list_sessions():
                 "message_count": len(session.messages)
             })
         return {"sessions": sessions}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/database/test")
+async def test_database():
+    """データベース接続をテスト"""
+    try:
+        result = database_service.test_connection()
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/database/sample-data")
+async def add_sample_data():
+    """サンプル物件データを追加"""
+    try:
+        result = database_service.add_sample_properties()
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/properties/search")
+async def search_properties(
+    area: Optional[str] = None,
+    max_price: Optional[int] = None,
+    room_type: Optional[str] = None,
+    limit: int = 10
+):
+    """物件を検索"""
+    try:
+        properties = database_service.search_properties(
+            area=area,
+            max_price=max_price, 
+            room_type=room_type,
+            limit=limit
+        )
+        return {
+            "properties": properties,
+            "count": len(properties)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/database/stats")
+async def get_database_stats():
+    """データベース統計情報を取得"""
+    try:
+        from app.config import DB_PATH
+        import sqlite3
+        
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            
+            # 全件数を取得
+            cursor.execute("SELECT COUNT(*) FROM BUY_data_url_uniqued")
+            total_count = cursor.fetchone()[0]
+            
+            # 価格統計
+            cursor.execute("""
+                SELECT 
+                    MIN(CAST(mi_price AS INTEGER)) as min_price,
+                    MAX(CAST(mi_price AS INTEGER)) as max_price,
+                    AVG(CAST(mi_price AS INTEGER)) as avg_price
+                FROM BUY_data_url_uniqued 
+                WHERE mi_price IS NOT NULL 
+                    AND mi_price != '' 
+                    AND CAST(mi_price AS INTEGER) > 0
+            """)
+            price_stats = cursor.fetchone()
+            
+            # 都道府県別上位10件
+            cursor.execute("""
+                SELECT pref, COUNT(*) as count
+                FROM BUY_data_url_uniqued 
+                WHERE pref IS NOT NULL AND pref != ''
+                GROUP BY pref
+                ORDER BY count DESC
+                LIMIT 10
+            """)
+            top_prefs = cursor.fetchall()
+            
+            return {
+                "total_properties": total_count,
+                "price_stats": {
+                    "min_price": price_stats[0] if price_stats[0] else 0,
+                    "max_price": price_stats[1] if price_stats[1] else 0,
+                    "avg_price": int(price_stats[2]) if price_stats[2] else 0
+                },
+                "top_prefectures": [{"prefecture": row[0], "count": row[1]} for row in top_prefs]
+            }
+            
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
