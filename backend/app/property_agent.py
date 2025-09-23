@@ -192,7 +192,7 @@ class PropertyAnalysisAgent:
                 cursor = conn.cursor()
                 
                 # 基本クエリ
-                base_query = "SELECT * FROM BUY_data_url_uniqued WHERE 1=1"
+                base_query = "SELECT * FROM BUY_data_integrated WHERE 1=1"
                 params = []
                 conditions = []
                 
@@ -252,24 +252,39 @@ class PropertyAnalysisAgent:
                 if conditions:
                     base_query += " AND " + " AND ".join(conditions)
                 
-                # 条件がない場合は件数のみ、条件がある場合は結果を制限
-                if not conditions:
-                    # 件数のみの問い合わせの場合は、COUNTクエリに変更
-                    base_query = "SELECT COUNT(*) as total_count FROM BUY_data_url_uniqued"
-                else:
-                    # 結果件数を制限
-                    base_query += " LIMIT 1000"
-                
-                logger.info(f"Executing SQL: {base_query}")
+                # まず総件数を取得
+                count_query = "SELECT COUNT(*) as total_count FROM BUY_data_integrated WHERE 1=1"
+                if conditions:
+                    count_query += " AND " + " AND ".join(conditions)
+
+                logger.info(f"Executing count query: {count_query}")
                 logger.info(f"Parameters: {params}")
-                
-                cursor.execute(base_query, params)
+
+                cursor.execute(count_query, params)
+                total_count = cursor.fetchone()[0]
+
+                # 次にサンプルデータを取得（制限付き）
+                sample_query = "SELECT * FROM BUY_data_integrated WHERE 1=1"
+                if conditions:
+                    sample_query += " AND " + " AND ".join(conditions)
+
+                logger.info(f"Executing sample query: {sample_query}")
+                cursor.execute(sample_query, params)
                 results = cursor.fetchall()
-                
-                logger.info(f"Query returned {len(results)} results")
-                
-                # 辞書形式に変換
-                return [dict(row) for row in results]
+
+                logger.info(f"Total count: {total_count}, Sample results: {len(results)}")
+
+                # 辞書形式に変換し、total_countを追加
+                result_list = [dict(row) for row in results]
+
+                # 結果の最初に総件数情報を追加
+                if result_list:
+                    result_list[0]['_total_count'] = total_count
+                else:
+                    # 結果が0件の場合も総件数を返す
+                    result_list = [{'_total_count': total_count}]
+
+                return result_list
                 
         except Exception as e:
             logger.error(f"Search execution error: {e}")
@@ -280,8 +295,13 @@ class PropertyAnalysisAgent:
         if not results:
             return {"total_count": 0}
         
+        # 総件数を取得（_total_countが設定されている場合はそれを使用）
+        total_count = len(results)
+        if results and '_total_count' in results[0]:
+            total_count = results[0]['_total_count']
+
         analysis = {
-            "total_count": len(results),
+            "total_count": total_count,
             "price_stats": {},
             "location_stats": {},
             "floor_plan_stats": {}
@@ -323,10 +343,36 @@ class PropertyAnalysisAgent:
         
         return analysis
     
-    async def _generate_ai_response(self, user_message: str, search_results: List[Dict], 
+    def _extract_search_area_from_message(self, message: str) -> str:
+        """ユーザーメッセージから検索対象の地域を抽出"""
+        import re
+
+        # 東京都のパターン
+        if "東京都" in message or "東京" in message:
+            return "東京都"
+        # 船橋のパターン
+        elif "船橋法典" in message:
+            return "船橋法典駅周辺"
+        elif "船橋" in message:
+            return "船橋市"
+        # その他の都道府県パターン
+        else:
+            # 県名を抽出する簡単なパターンマッチング
+            patterns = [r'([^\s]+県)', r'([^\s]+府)', r'([^\s]+都)', r'([^\s]+道)']
+            for pattern in patterns:
+                match = re.search(pattern, message)
+                if match:
+                    return match.group(1)
+
+        return "指定地域"
+
+    async def _generate_ai_response(self, user_message: str, search_results: List[Dict],
                                    analysis_results: Dict, session_context: List[Dict], location_preprocessing: Dict = None) -> str:
         """検索結果と分析結果を基にAI応答を生成"""
-        
+
+        # 総件数を取得
+        total_count = analysis_results.get('total_count', 0)
+
         # 検索結果のサマリーを作成（最初の5件）
         sample_results = search_results[:5]
         results_summary = []
@@ -335,7 +381,7 @@ class PropertyAnalysisAgent:
             address = result.get("address", "不明")
             floor_plan = result.get("floor_plan", "不明")
             results_summary.append(f"・{address} {floor_plan} {price}円")
-        
+
         # 地域補正メッセージの作成
         location_correction_msg = ""
         if location_preprocessing and location_preprocessing.get("correction_made"):
@@ -343,36 +389,63 @@ class PropertyAnalysisAgent:
             corrected = location_preprocessing.get("normalized_locations", [])
             if corrected:
                 location_correction_msg = f"\n※「{original}」を「{', '.join(corrected)}」で検索しました。"
-        
+
         # デバッグ: LLMに渡すデータを確認
-        total_count = analysis_results.get('total_count', 0)
         logger.info(f"LLM prompt data - Total count: {total_count}, Results length: {len(search_results)}")
-        logger.info(f"Sample results summary: {results_summary[:200]}...")
-        
+        logger.info(f"Sample results summary: {results_summary}")
+
+        # ユーザーの質問から検索対象の地域を抽出
+        search_area = self._extract_search_area_from_message(user_message)
+
+        # データ整合性の確認
+        has_results = total_count > 0 and len(results_summary) > 0
+
         response_prompt = [
             {
                 "role": "system",
                 "content": f"""あなたは不動産分析の専門家です。
 
-【確認】以下は船橋法典駅周辺の実際の検索結果です：
-- 検索で見つかった物件数: {analysis_results.get('total_count', 0)}件
-- これらは全て船橋法典駅に関連する物件です
+【重要な指示】
+- 総件数が{total_count}件です。この数字は正確です。
+- {total_count}件 > 0 の場合は、必ず「物件が見つかりました」と答えてください。
+- 「見当たりませんでした」や「見つかりませんでした」と答えてはいけません。
 
 【検索結果データ】
-総件数: {analysis_results.get('total_count', 0)}件
+総件数: {total_count}件
 価格統計: {json.dumps(analysis_results.get('price_stats', {}), ensure_ascii=False)}
-地域分布: {json.dumps(analysis_results.get('location_stats', {}), ensure_ascii=False)}
 間取り分布: {json.dumps(analysis_results.get('floor_plan_stats', {}), ensure_ascii=False)}
 
-【実際の物件例（船橋法典駅関連）】
-{chr(10).join(results_summary)}
+【実際の物件例（最初の5件）】
+{chr(10).join(results_summary) if results_summary else "物件データの詳細表示に問題があります"}
 
 {f"【地域補正情報】{location_correction_msg}" if location_correction_msg else ""}
 
-**回答フォーマット（必須）:**
-「船橋法典駅周辺で{analysis_results.get('total_count', 0)}件の物件が見つかりました。」から始めて、価格帯、物件例、地域特性を説明してください。
+**必須回答形式（UIで読みやすいように改行を含めてください）:**
 
-検索結果が存在しているため、否定的な表現（「見つからない」「含まれていない」等）は一切使用禁止です。"""
+1. まず検索地域と総件数を明記
+2. 価格統計（最安値、最高値、平均価格）を改行して表示
+3. 間取り分布を改行して表示
+4. 物件例を番号付きリストで改行して表示
+5. 最後に簡潔なまとめ
+
+以下の形式で回答してください：
+
+{search_area}に関する不動産物件の検索結果は以下の通りです。
+
+【検索結果データ】
+- 総件数: X件
+- 価格統計: 最安値 X円、最高値 X円、平均価格 X円
+- 主な間取り: 3LDK (X件)、2LDK (X件) など
+
+【実際の物件例】
+1. 住所 間取り 価格
+2. 住所 間取り 価格
+...
+
+以上の情報から、この地域には様々な間取りと価格帯の物件が存在していることが分かります。
+
+**検索結果の状態: {"物件あり" if has_results else "物件なし"}**
+"""
             }
         ]
         
@@ -393,6 +466,11 @@ class PropertyAnalysisAgent:
         # LLMが使えない場合のフォールバック応答
         if llm_response is None:
             logger.error("LLM service unavailable for response generation, using fallback")
+            return self._generate_fallback_response(user_message, search_results, analysis_results, location_preprocessing)
+
+        # 応答の妥当性チェック
+        if total_count > 0 and ("見当たりませんでした" in llm_response or "見つかりませんでした" in llm_response):
+            logger.warning(f"LLM generated incorrect response for {total_count} results, using fallback")
             return self._generate_fallback_response(user_message, search_results, analysis_results, location_preprocessing)
         
         return llm_response
@@ -466,70 +544,339 @@ class PropertyAnalysisAgent:
         """セッションデータを取得"""
         return self.session_data.get(session_id, {})
     
+    def _identify_location_hierarchy(self, location_text: str) -> Dict:
+        """地域の階層レベルを識別"""
+        import re
+        hierarchy = {
+            'prefecture': None,
+            'city': None,
+            'ward': None,
+            'town': None,
+            'level': None
+        }
+
+        # 都道府県パターン（県、都、府、道で終わる）
+        prefecture_patterns = [
+            r'(北海道)',
+            r'(.+県)',
+            r'(.+都)',
+            r'(.+府)'
+        ]
+
+        for pattern in prefecture_patterns:
+            match = re.search(pattern, location_text)
+            if match:
+                hierarchy['prefecture'] = match.group(1)
+                hierarchy['level'] = 'prefecture'
+
+                # 市区町村が続く場合
+                after_pref = location_text[match.end():]
+                if after_pref:
+                    # 市レベル
+                    city_match = re.search(r'([^区町村]+市)', after_pref)
+                    if city_match:
+                        hierarchy['city'] = city_match.group(1)
+                        hierarchy['level'] = 'city'
+
+                        # 区レベル
+                        after_city = after_pref[city_match.end():]
+                        if after_city:
+                            ward_match = re.search(r'([^町村]+区)', after_city)
+                            if ward_match:
+                                hierarchy['ward'] = ward_match.group(1)
+                                hierarchy['level'] = 'ward'
+
+                                # 町レベル
+                                after_ward = after_city[ward_match.end():]
+                                if after_ward:
+                                    town_match = re.search(r'([^。、\\s]{2,})', after_ward)
+                                    if town_match:
+                                        town_name = town_match.group(1)
+                                        # 不適切な語尾を除外
+                                        invalid_suffixes = ['で絞って', 'で絞る', 'について', 'に関して', 'の情報', 'のデータ']
+                                        is_valid = True
+                                        for suffix in invalid_suffixes:
+                                            if town_name.endswith(suffix):
+                                                town_name = town_name[:-len(suffix)]
+                                                if len(town_name) < 2:
+                                                    is_valid = False
+                                                break
+                                        # 数字のみや短すぎる場合は除外
+                                        if is_valid and not town_name.isdigit() and len(town_name) >= 2:
+                                            hierarchy['town'] = town_name
+                                            hierarchy['level'] = 'town'
+                    else:
+                        # 区が直接続く場合（政令指定都市以外）
+                        ward_match = re.search(r'([^町村]+区)', after_pref)
+                        if ward_match:
+                            hierarchy['ward'] = ward_match.group(1)
+                            hierarchy['level'] = 'ward'
+
+                            # 区の後に町名が続く場合をチェック
+                            after_ward = after_pref[ward_match.end():]
+                            if after_ward:
+                                town_match = re.search(r'([^。、\\s]{2,})', after_ward)
+                                if town_match:
+                                    town_name = town_match.group(1)
+                                    # 不適切な語尾を除外
+                                    invalid_suffixes = ['で絞って', 'で絞る', 'について', 'に関して', 'の情報', 'のデータ']
+                                    is_valid = True
+                                    for suffix in invalid_suffixes:
+                                        if town_name.endswith(suffix):
+                                            town_name = town_name[:-len(suffix)]
+                                            if len(town_name) < 2:
+                                                is_valid = False
+                                            break
+                                    # 数字のみや短すぎる場合は除外
+                                    if is_valid and not town_name.isdigit() and len(town_name) >= 2:
+                                        hierarchy['town'] = town_name
+                                        hierarchy['level'] = 'town'
+                        else:
+                            # 町村レベル（町村以外の地名も含む）
+                            town_match = re.search(r'([^。、\\s]{2,})', after_pref)
+                            if town_match:
+                                town_name = town_match.group(1)
+                                # 不適切な語尾を除外
+                                invalid_suffixes = ['で絞って', 'で絞る', 'について', 'に関して', 'の情報', 'のデータ']
+                                is_valid = True
+                                for suffix in invalid_suffixes:
+                                    if town_name.endswith(suffix):
+                                        town_name = town_name[:-len(suffix)]
+                                        if len(town_name) < 2:
+                                            is_valid = False
+                                        break
+                                # 数字のみや短すぎる場合は除外
+                                if is_valid and not town_name.isdigit() and len(town_name) >= 2:
+                                    hierarchy['town'] = town_name
+                                    hierarchy['level'] = 'town'
+                break
+
+        return hierarchy
+
+    def _build_hierarchical_query(self, hierarchy: Dict) -> tuple:
+        """階層に応じたクエリを構築"""
+        conditions = []
+        params = []
+
+        if hierarchy['level'] == 'prefecture' and hierarchy['prefecture']:
+            conditions.append("pref LIKE ?")
+            params.append(f"%{hierarchy['prefecture']}%")
+
+        elif hierarchy['level'] == 'city' and hierarchy['city']:
+            if hierarchy['prefecture']:
+                conditions.append("pref LIKE ?")
+                params.append(f"%{hierarchy['prefecture']}%")
+            conditions.append("municipality_city_name LIKE ?")
+            params.append(f"%{hierarchy['city']}%")
+
+        elif hierarchy['level'] == 'ward' and hierarchy['ward']:
+            if hierarchy['prefecture']:
+                conditions.append("pref LIKE ?")
+                params.append(f"%{hierarchy['prefecture']}%")
+            if hierarchy['city']:
+                conditions.append("municipality_city_name LIKE ?")
+                params.append(f"%{hierarchy['city']}%")
+
+            # 東京都の特別区は municipality_name を使用
+            if hierarchy['prefecture'] == '東京都':
+                conditions.append("municipality_name LIKE ?")
+                params.append(f"%{hierarchy['ward']}%")
+            else:
+                conditions.append("ward_name LIKE ?")
+                params.append(f"%{hierarchy['ward']}%")
+
+        elif hierarchy['level'] == 'town' and hierarchy['town']:
+            if hierarchy['prefecture']:
+                conditions.append("pref LIKE ?")
+                params.append(f"%{hierarchy['prefecture']}%")
+            if hierarchy['city']:
+                conditions.append("municipality_city_name LIKE ?")
+                params.append(f"%{hierarchy['city']}%")
+            if hierarchy['ward']:
+                # 東京都の特別区は municipality_name を使用
+                if hierarchy['prefecture'] == '東京都':
+                    conditions.append("municipality_name LIKE ?")
+                    params.append(f"%{hierarchy['ward']}%")
+                else:
+                    conditions.append("ward_name LIKE ?")
+                    params.append(f"%{hierarchy['ward']}%")
+            conditions.append("town_name LIKE ?")
+            params.append(f"%{hierarchy['town']}%")
+
+        # フォールバック：addressでの検索
+        if not conditions:
+            conditions.append("address LIKE ?")
+            params.append(f"%{hierarchy.get('prefecture', '') + hierarchy.get('city', '') + hierarchy.get('ward', '') + hierarchy.get('town', '')}%")
+
+        where_clause = " AND ".join(conditions)
+        return where_clause, params
+
     def _check_direct_location_query(self, message: str) -> List[Dict]:
-        """直接的な地域クエリかチェックして、該当する場合は直接検索実行"""
+        """階層的地域検索による直接検索"""
+        try:
+            # まず完全一致での検索を試す（ユーザー入力をそのまま使用）
+            exact_match_results = self._try_exact_address_search(message.strip())
+            if exact_match_results:
+                return exact_match_results
+
+            # 地域階層を識別
+            hierarchy = self._identify_location_hierarchy(message)
+
+            if not hierarchy['level']:
+                # 従来のキーワード検索にフォールバック
+                return self._legacy_location_search(message)
+
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+
+                # 階層的クエリを構築
+                where_clause, params = self._build_hierarchical_query(hierarchy)
+
+                # 正確なカウントを取得
+                count_query = f"SELECT COUNT(*) as total_count FROM BUY_data_integrated WHERE {where_clause} AND mi_price IS NOT NULL AND mi_price != '' AND mi_price != '0'"
+                logger.info(f"Hierarchical count query: {count_query}, Params: {params}")
+                cursor.execute(count_query, params)
+                total_count = cursor.fetchone()[0]
+
+                # サンプルデータを取得
+                sample_query = f"SELECT * FROM BUY_data_integrated WHERE {where_clause} AND mi_price IS NOT NULL AND mi_price != '' AND mi_price != '0'"
+                logger.info(f"Hierarchical sample query: {sample_query}, Params: {params}")
+                cursor.execute(sample_query, params)
+                results = cursor.fetchall()
+
+                logger.info(f"Hierarchical search - Total count: {total_count}, Sample results: {len(results)}")
+
+                # 階層検索で結果が0件の場合、address列での部分一致検索にフォールバック
+                if total_count == 0:
+                    logger.info("Hierarchical search returned 0 results, falling back to address search")
+                    # 元のメッセージから検索キーワードを作成
+                    search_term = f"{hierarchy.get('prefecture', '')}{hierarchy.get('city', '')}{hierarchy.get('ward', '')}{hierarchy.get('town', '')}"
+                    if search_term:
+                        fallback_count_query = "SELECT COUNT(*) as total_count FROM BUY_data_integrated WHERE address LIKE ? AND mi_price IS NOT NULL AND mi_price != '' AND mi_price != '0'"
+                        fallback_params = [f"%{search_term}%"]
+                        logger.info(f"Fallback count query: {fallback_count_query}, Params: {fallback_params}")
+                        cursor.execute(fallback_count_query, fallback_params)
+                        fallback_total_count = cursor.fetchone()[0]
+
+                        fallback_sample_query = "SELECT * FROM BUY_data_integrated WHERE address LIKE ? AND mi_price IS NOT NULL AND mi_price != '' AND mi_price != '0'"
+                        logger.info(f"Fallback sample query: {fallback_sample_query}, Params: {fallback_params}")
+                        cursor.execute(fallback_sample_query, fallback_params)
+                        fallback_results = cursor.fetchall()
+
+                        logger.info(f"Fallback address search - Total count: {fallback_total_count}, Sample results: {len(fallback_results)}")
+
+                        # フォールバック結果を返す
+                        fallback_result_list = [dict(row) for row in fallback_results]
+                        if fallback_result_list:
+                            fallback_result_list[0]['_total_count'] = fallback_total_count
+                            fallback_result_list[0]['_search_method'] = 'address_fallback'
+                        else:
+                            fallback_result_list = [{'_total_count': fallback_total_count, '_search_method': 'address_fallback'}]
+
+                        return fallback_result_list
+
+                # 結果を辞書のリストに変換し、総件数を追加
+                result_list = [dict(row) for row in results]
+                if result_list:
+                    result_list[0]['_total_count'] = total_count
+                    result_list[0]['_search_method'] = 'hierarchical'
+                else:
+                    result_list = [{'_total_count': total_count, '_search_method': 'hierarchical'}]
+
+                return result_list
+
+        except Exception as e:
+            logger.error(f"Hierarchical location search error: {e}")
+            return self._legacy_location_search(message)
+
+    def _try_exact_address_search(self, query: str) -> List[Dict]:
+        """ユーザー入力をそのまま使用した完全一致検索"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+
+                # ユーザー入力をそのままLIKE検索で使用
+                search_pattern = f"%{query}%"
+
+                # 正確なカウントを取得
+                count_query = "SELECT COUNT(*) as total_count FROM BUY_data_integrated WHERE address LIKE ? AND mi_price IS NOT NULL AND mi_price != '' AND mi_price != '0'"
+                logger.info(f"Exact address search count query: {count_query}, Pattern: {search_pattern}")
+                cursor.execute(count_query, [search_pattern])
+                total_count = cursor.fetchone()[0]
+
+                # 結果が存在する場合のみサンプルデータを取得
+                if total_count > 0:
+                    sample_query = "SELECT * FROM BUY_data_integrated WHERE address LIKE ? AND mi_price IS NOT NULL AND mi_price != '' AND mi_price != '0'"
+                    logger.info(f"Exact address search sample query: {sample_query}, Pattern: {search_pattern}")
+                    cursor.execute(sample_query, [search_pattern])
+                    results = cursor.fetchall()
+
+                    logger.info(f"Exact address search - Total count: {total_count}, Sample results: {len(results)}")
+
+                    # 結果を辞書のリストに変換し、総件数を追加
+                    result_list = [dict(row) for row in results]
+                    if result_list:
+                        result_list[0]['_total_count'] = total_count
+                        result_list[0]['_search_method'] = 'exact_address'
+                    else:
+                        result_list = [{'_total_count': total_count, '_search_method': 'exact_address'}]
+
+                    return result_list
+
+                return []
+
+        except Exception as e:
+            logger.error(f"Exact address search error: {e}")
+            return []
+
+    def _legacy_location_search(self, message: str) -> List[Dict]:
+        """従来の地域検索（フォールバック用）"""
         message_lower = message.lower()
-        
-        # 船橋法典駅のパターン
-        if "船橋法典" in message_lower:
-            try:
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.row_factory = sqlite3.Row
-                    cursor = conn.cursor()
-                    
-                    query = "SELECT * FROM BUY_data_url_uniqued WHERE traffic1 LIKE ? LIMIT 1000"
-                    params = ["%船橋法典%"]
-                    
-                    logger.info(f"Direct search - SQL: {query}, Params: {params}")
-                    cursor.execute(query, params)
-                    results = cursor.fetchall()
-                    logger.info(f"Direct search returned {len(results)} results")
-                    
-                    return [dict(row) for row in results]
-            except Exception as e:
-                logger.error(f"Direct location search error: {e}")
-                return []
-        
-        # 船橋市の一般的なパターン
-        elif "船橋" in message_lower:
-            try:
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.row_factory = sqlite3.Row
-                    cursor = conn.cursor()
-                    
-                    query = "SELECT * FROM BUY_data_url_uniqued WHERE address LIKE ? OR traffic1 LIKE ? LIMIT 1000"
-                    params = ["%船橋%", "%船橋%"]
-                    
-                    logger.info(f"Direct search - SQL: {query}, Params: {params}")
-                    cursor.execute(query, params)
-                    results = cursor.fetchall()
-                    logger.info(f"Direct search returned {len(results)} results")
-                    
-                    return [dict(row) for row in results]
-            except Exception as e:
-                logger.error(f"Direct location search error: {e}")
-                return []
-        
-        # 千葉県のパターン
-        elif "千葉" in message_lower:
-            try:
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.row_factory = sqlite3.Row
-                    cursor = conn.cursor()
-                    
-                    query = "SELECT * FROM BUY_data_url_uniqued WHERE pref LIKE ? OR address LIKE ? LIMIT 1000"
-                    params = ["%千葉%", "%千葉%"]
-                    
-                    logger.info(f"Direct search - SQL: {query}, Params: {params}")
-                    cursor.execute(query, params)
-                    results = cursor.fetchall()
-                    logger.info(f"Direct search returned {len(results)} results")
-                    
-                    return [dict(row) for row in results]
-            except Exception as e:
-                logger.error(f"Direct location search error: {e}")
-                return []
-        
+
+        # 特定のキーワードパターンでの検索
+        search_patterns = [
+            ("東京", "%東京%"),
+            ("船橋法典", "%船橋法典%"),
+            ("船橋", "%船橋%"),
+            ("千葉", "%千葉%")
+        ]
+
+        for keyword, pattern in search_patterns:
+            if keyword in message_lower:
+                try:
+                    with sqlite3.connect(self.db_path) as conn:
+                        conn.row_factory = sqlite3.Row
+                        cursor = conn.cursor()
+
+                        # 正確なカウントを取得
+                        count_query = "SELECT COUNT(*) as total_count FROM BUY_data_integrated WHERE address LIKE ? AND mi_price IS NOT NULL AND mi_price != '' AND mi_price != '0'"
+                        cursor.execute(count_query, [pattern])
+                        total_count = cursor.fetchone()[0]
+
+                        # サンプルデータを取得
+                        query = "SELECT * FROM BUY_data_integrated WHERE address LIKE ? AND mi_price IS NOT NULL AND mi_price != '' AND mi_price != '0'"
+                        params = [pattern]
+
+                        logger.info(f"Legacy search - SQL: {query}, Params: {params}")
+                        cursor.execute(query, params)
+                        results = cursor.fetchall()
+                        logger.info(f"Legacy search - Total count: {total_count}, Sample results: {len(results)}")
+
+                        # 結果を辞書のリストに変換し、総件数を追加
+                        result_list = [dict(row) for row in results]
+                        if result_list:
+                            result_list[0]['_total_count'] = total_count
+                        else:
+                            result_list = [{'_total_count': total_count}]
+
+                        return result_list
+
+                except Exception as e:
+                    logger.error(f"Legacy location search error: {e}")
+                    continue
+
         return []
     
     def _fallback_query_analysis(self, message: str) -> Dict:
@@ -585,45 +932,70 @@ class PropertyAnalysisAgent:
         logger.info(f"Fallback query analysis: {analysis}")
         return analysis
     
-    def _generate_fallback_response(self, user_message: str, search_results: List[Dict], 
+    def _generate_fallback_response(self, user_message: str, search_results: List[Dict],
                                    analysis_results: Dict, location_preprocessing: Dict = None) -> str:
         """LLMが使えない場合のフォールバック応答生成"""
         total_count = analysis_results.get('total_count', 0)
         price_stats = analysis_results.get('price_stats', {})
-        
+        floor_plan_stats = analysis_results.get('floor_plan_stats', {})
+
         if total_count == 0:
             return f"申し訳ございませんが、指定された条件に合う物件は見つかりませんでした。検索条件を変更して再度お試しください。"
-        
+
         response_parts = []
-        
+
         # 地域補正メッセージ
         if location_preprocessing and location_preprocessing.get("correction_made"):
             original = location_preprocessing.get("original_input", "")
             corrected = location_preprocessing.get("normalized_locations", [])
             if corrected:
                 response_parts.append(f"「{original}」を「{', '.join(corrected)}」で検索しました。")
-        
-        # 基本統計
-        response_parts.append(f"検索結果：{total_count:,}件の物件が見つかりました。")
-        
+
+        # 検索結果の明確な表示
+        search_area = self._extract_search_area_from_message(user_message)
+        response_parts.append(f"{search_area}に関する不動産物件の検索結果は以下の通りです。")
+        response_parts.append(f"")  # 空行
+        response_parts.append(f"【検索結果データ】")
+        response_parts.append(f"- 総件数: {total_count:,}件")
+
         # 価格統計があれば追加
         if price_stats:
             min_price = price_stats.get('min_price')
             max_price = price_stats.get('max_price')
             avg_price = price_stats.get('avg_price')
-            
+            count = price_stats.get('count')
+
             if min_price and max_price and avg_price:
-                response_parts.append(f"価格範囲：{min_price:,}円 〜 {max_price:,}円（平均：{avg_price:,.0f}円）")
-        
-        # サンプル物件（最初の3件）
+                min_price_man = int(min_price / 10000)
+                max_price_man = int(max_price / 10000)
+                avg_price_man = int(avg_price / 10000)
+                response_parts.append(f"- 価格統計: 最安値 {min_price_man:,}万円、最高値 {max_price_man:,}万円、平均価格 {avg_price_man:,}万円")
+
+        # 間取り分布があれば追加（上位5つのみ）
+        if floor_plan_stats and floor_plan_stats.get('distribution'):
+            distribution = floor_plan_stats['distribution']
+            top_plans = list(distribution.items())[:5]
+            plan_str = "、".join([f"{plan} ({count}件)" for plan, count in top_plans])
+            response_parts.append(f"- 主な間取り: {plan_str}")
+
+        # サンプル物件（最初の5件）
         if search_results and len(search_results) > 0:
-            response_parts.append("\n物件例：")
-            for i, result in enumerate(search_results[:3], 1):
+            response_parts.append(f"")  # 空行
+            response_parts.append(f"【実際の物件例】")
+            for i, result in enumerate(search_results[:5], 1):
                 address = result.get("address", "住所不明")
                 price = result.get("mi_price", "価格不明")
                 floor_plan = result.get("floor_plan", "間取り不明")
-                response_parts.append(f"{i}. {address} {floor_plan} {price}円")
-        
+                try:
+                    price_man = int(int(price) / 10000)
+                    price_display = f"{price_man:,}万円"
+                except:
+                    price_display = f"{price}円"
+                response_parts.append(f"{i}. {address} {floor_plan} {price_display}")
+
+        response_parts.append(f"")  # 空行
+        response_parts.append(f"以上の情報から、{search_area}には様々な間取りと価格帯の物件が存在していることが分かります。")
+
         return "\n".join(response_parts)
     
     def _is_count_only_query(self, message: str) -> bool:
@@ -656,7 +1028,7 @@ class PropertyAnalysisAgent:
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT COUNT(*) FROM BUY_data_url_uniqued")
+                cursor.execute("SELECT COUNT(*) FROM BUY_data_integrated")
                 return cursor.fetchone()[0]
         except Exception as e:
             logger.error(f"Failed to get total count: {e}")
