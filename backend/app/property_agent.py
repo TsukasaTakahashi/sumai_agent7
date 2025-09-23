@@ -2,17 +2,113 @@ import sqlite3
 import json
 import logging
 from typing import List, Dict, Optional, Tuple
+from datetime import datetime, timedelta
 from app.config import DB_PATH
 from app.llm_service import llm_service
 from app.models import AgentResponse
 
 logger = logging.getLogger(__name__)
 
+class PropertyRecommendationScorer:
+    """物件のおすすめ度を計算するクラス（将来的な拡張性を考慮した設計）"""
+
+    def __init__(self):
+        self.scoring_methods = [
+            self._score_by_listing_date,
+            # 将来的に追加される評価メソッド:
+            # self._score_by_price_value,
+            # self._score_by_location_popularity,
+            # self._score_by_property_features,
+        ]
+
+    def calculate_recommendation_score(self, property_data: Dict) -> float:
+        """物件のおすすめ度を計算（0-100のスケール）"""
+        total_score = 0.0
+        max_possible_score = 0.0
+
+        for scoring_method in self.scoring_methods:
+            try:
+                score, weight = scoring_method(property_data)
+                total_score += score * weight
+                max_possible_score += 100 * weight
+                logger.debug(f"Scoring method {scoring_method.__name__}: score={score}, weight={weight}")
+            except Exception as e:
+                logger.warning(f"Scoring method {scoring_method.__name__} failed: {e}")
+                continue
+
+        if max_possible_score == 0:
+            return 0.0
+
+        # 0-100のスケールに正規化
+        normalized_score = (total_score / max_possible_score) * 100
+        return min(100.0, max(0.0, normalized_score))
+
+    def _score_by_listing_date(self, property_data: Dict) -> Tuple[float, float]:
+        """掲載日による評価（新しいほど高スコア）"""
+        try:
+            last_listed_date = property_data.get('last_listed_date')
+            if not last_listed_date:
+                return 50.0, 1.0  # デフォルトスコア、重み1.0
+
+            # 日付文字列をパース
+            if isinstance(last_listed_date, str):
+                try:
+                    listed_date = datetime.strptime(last_listed_date, '%Y-%m-%d')
+                except ValueError:
+                    # 異なる日付フォーマットの場合の処理
+                    try:
+                        listed_date = datetime.strptime(last_listed_date.split()[0], '%Y-%m-%d')
+                    except ValueError:
+                        return 50.0, 1.0
+            else:
+                return 50.0, 1.0
+
+            current_date = datetime.now()
+            days_since_listing = (current_date - listed_date).days
+
+            # スコア計算ロジック：
+            # 0日前（今日）: 100点
+            # 7日前: 80点
+            # 30日前: 50点
+            # 90日前: 20点
+            # 180日以上前: 10点
+            if days_since_listing <= 0:
+                score = 100.0
+            elif days_since_listing <= 7:
+                score = 100.0 - (days_since_listing * 2.86)  # 7日で20点減
+            elif days_since_listing <= 30:
+                score = 80.0 - ((days_since_listing - 7) * 1.30)  # 23日で30点減
+            elif days_since_listing <= 90:
+                score = 50.0 - ((days_since_listing - 30) * 0.50)  # 60日で30点減
+            elif days_since_listing <= 180:
+                score = 20.0 - ((days_since_listing - 90) * 0.11)  # 90日で10点減
+            else:
+                score = 10.0
+
+            weight = 1.0  # 現在の重み（将来的に調整可能）
+            return max(0.0, score), weight
+
+        except Exception as e:
+            logger.warning(f"Listing date scoring failed: {e}")
+            return 50.0, 1.0
+
+    # 将来追加される評価メソッドの例:
+    # def _score_by_price_value(self, property_data: Dict) -> Tuple[float, float]:
+    #     """価格対価値による評価"""
+    #     # 実装例: 周辺相場との比較、㎡単価評価など
+    #     pass
+    #
+    # def _score_by_location_popularity(self, property_data: Dict) -> Tuple[float, float]:
+    #     """立地人気度による評価"""
+    #     # 実装例: 駅からの距離、周辺施設、治安指数など
+    #     pass
+
 class PropertyAnalysisAgent:
     """価格と住所の複雑な分析に特化したAgent"""
-    
+
     def __init__(self):
         self.db_path = DB_PATH
+        self.recommendation_scorer = PropertyRecommendationScorer()
         self.session_data = {}  # セッション毎のデータ保存
         
     async def analyze_query(self, message: str, session_id: str) -> AgentResponse:
@@ -376,11 +472,16 @@ class PropertyAnalysisAgent:
         # 検索結果のサマリーを作成（最初の5件）
         sample_results = search_results[:5]
         results_summary = []
-        for result in sample_results:
-            price = result.get("mi_price", "不明")
-            address = result.get("address", "不明")
-            floor_plan = result.get("floor_plan", "不明")
-            results_summary.append(f"・{address} {floor_plan} {price}円")
+
+        if total_count == 0:
+            # 0件の場合の専用メッセージ
+            results_summary.append("該当する物件が見つかりませんでした")
+        else:
+            for result in sample_results:
+                price = result.get("mi_price", "不明")
+                address = result.get("address", "不明")
+                floor_plan = result.get("floor_plan", "不明")
+                results_summary.append(f"・{address} {floor_plan} {price}円")
 
         # 地域補正メッセージの作成
         location_correction_msg = ""
@@ -400,6 +501,21 @@ class PropertyAnalysisAgent:
         # データ整合性の確認
         has_results = total_count > 0 and len(results_summary) > 0
 
+        # 件数チェック：100件を超える場合の絞り込み推奨
+        refinement_suggestion = ""
+        if total_count > 100:
+            refinement_suggestion = f"""
+
+【絞り込み推奨】
+検索結果が{total_count}件と多いため、より具体的な条件での絞り込みをお勧めします。
+以下の条件で絞り込んでみてください：
+- より具体的な地域名（○○町、○○駅周辺など）
+- 価格帯（例：5000万円以下、1億円以下など）
+- 間取り（例：3LDK、4LDKなど）
+- 築年数（例：築10年以内など）
+
+もう少し絞り込んでいただけると、より適切な物件をご提案できます。"""
+
         response_prompt = [
             {
                 "role": "system",
@@ -407,8 +523,9 @@ class PropertyAnalysisAgent:
 
 【重要な指示】
 - 総件数が{total_count}件です。この数字は正確です。
+- {total_count}件 = 0 の場合は、「該当する物件が見つかりませんでした」と明確に答えてください。
 - {total_count}件 > 0 の場合は、必ず「物件が見つかりました」と答えてください。
-- 「見当たりませんでした」や「見つかりませんでした」と答えてはいけません。
+- {total_count}件 > 100の場合は、必ず絞り込み推奨メッセージを含めてください。
 
 【検索結果データ】
 総件数: {total_count}件
@@ -416,7 +533,7 @@ class PropertyAnalysisAgent:
 間取り分布: {json.dumps(analysis_results.get('floor_plan_stats', {}), ensure_ascii=False)}
 
 【実際の物件例（最初の5件）】
-{chr(10).join(results_summary) if results_summary else "物件データの詳細表示に問題があります"}
+{chr(10).join(results_summary)}
 
 {f"【地域補正情報】{location_correction_msg}" if location_correction_msg else ""}
 
@@ -426,7 +543,8 @@ class PropertyAnalysisAgent:
 2. 価格統計（最安値、最高値、平均価格）を改行して表示
 3. 間取り分布を改行して表示
 4. 物件例を番号付きリストで改行して表示
-5. 最後に簡潔なまとめ
+5. {total_count}件 > 100の場合は絞り込み推奨メッセージを必ず含める
+6. 最後に簡潔なまとめ
 
 以下の形式で回答してください：
 
@@ -442,9 +560,12 @@ class PropertyAnalysisAgent:
 2. 住所 間取り 価格
 ...
 
+{refinement_suggestion}
+
 以上の情報から、この地域には様々な間取りと価格帯の物件が存在していることが分かります。
 
 **検索結果の状態: {"物件あり" if has_results else "物件なし"}**
+**件数チェック: {"絞り込み推奨" if total_count > 100 else "適切な件数"}**
 """
             }
         ]
@@ -475,6 +596,18 @@ class PropertyAnalysisAgent:
         
         return llm_response
     
+    def _normalize_location_text(self, text: str) -> str:
+        """地域名の表記揺れを正規化"""
+        if not text:
+            return text
+
+        # よくある表記揺れを修正
+        normalized = text.replace('ヶ', 'ケ')  # 保土ヶ谷区 → 保土ケ谷区
+        normalized = normalized.replace('が', 'ガ')  # 世田が谷 → 世田ガ谷
+        normalized = normalized.replace('ヴ', 'ブ')  # ヴィラ → ビラ
+
+        return normalized
+
     async def _preprocess_location_query(self, message: str, session_context: List[Dict]) -> Dict:
         """地域クエリの前処理（タイポ補正・正規化）"""
         preprocessing_prompt = [
@@ -495,6 +628,7 @@ class PropertyAnalysisAgent:
 - ひらがな/カタカナ → 漢字に変換（例：「かながわけん」→「神奈川県」）
 - 略称 → 正式名称（例：「神奈川」→「神奈川県」）
 - タイポ補正（例：「かんんがわけん」→「神奈川県」）
+- 表記揺れの統一（例：「保土ヶ谷区」→「保土ケ谷区」、「ヶ」→「ケ」、「が」→「ガ」）
 - 一般的な表記揺れの統一
 
 地域名が含まれていない場合は has_location: false を返してください。"""
@@ -660,53 +794,59 @@ class PropertyAnalysisAgent:
 
         if hierarchy['level'] == 'prefecture' and hierarchy['prefecture']:
             conditions.append("pref LIKE ?")
-            params.append(f"%{hierarchy['prefecture']}%")
+            params.append(f"%{self._normalize_location_text(hierarchy['prefecture'])}%")
 
         elif hierarchy['level'] == 'city' and hierarchy['city']:
             if hierarchy['prefecture']:
                 conditions.append("pref LIKE ?")
-                params.append(f"%{hierarchy['prefecture']}%")
-            conditions.append("municipality_city_name LIKE ?")
-            params.append(f"%{hierarchy['city']}%")
+                params.append(f"%{self._normalize_location_text(hierarchy['prefecture'])}%")
+            conditions.append("municipality_name LIKE ?")
+            params.append(f"%{self._normalize_location_text(hierarchy['city'])}%")
 
         elif hierarchy['level'] == 'ward' and hierarchy['ward']:
             if hierarchy['prefecture']:
                 conditions.append("pref LIKE ?")
-                params.append(f"%{hierarchy['prefecture']}%")
+                params.append(f"%{self._normalize_location_text(hierarchy['prefecture'])}%")
             if hierarchy['city']:
-                conditions.append("municipality_city_name LIKE ?")
-                params.append(f"%{hierarchy['city']}%")
+                conditions.append("municipality_name LIKE ?")
+                params.append(f"%{self._normalize_location_text(hierarchy['city'])}%")
 
             # 東京都の特別区は municipality_name を使用
             if hierarchy['prefecture'] == '東京都':
                 conditions.append("municipality_name LIKE ?")
-                params.append(f"%{hierarchy['ward']}%")
+                params.append(f"%{self._normalize_location_text(hierarchy['ward'])}%")
             else:
                 conditions.append("ward_name LIKE ?")
-                params.append(f"%{hierarchy['ward']}%")
+                params.append(f"%{self._normalize_location_text(hierarchy['ward'])}%")
 
         elif hierarchy['level'] == 'town' and hierarchy['town']:
             if hierarchy['prefecture']:
                 conditions.append("pref LIKE ?")
-                params.append(f"%{hierarchy['prefecture']}%")
+                params.append(f"%{self._normalize_location_text(hierarchy['prefecture'])}%")
             if hierarchy['city']:
-                conditions.append("municipality_city_name LIKE ?")
-                params.append(f"%{hierarchy['city']}%")
+                conditions.append("municipality_name LIKE ?")
+                params.append(f"%{self._normalize_location_text(hierarchy['city'])}%")
             if hierarchy['ward']:
                 # 東京都の特別区は municipality_name を使用
                 if hierarchy['prefecture'] == '東京都':
                     conditions.append("municipality_name LIKE ?")
-                    params.append(f"%{hierarchy['ward']}%")
+                    params.append(f"%{self._normalize_location_text(hierarchy['ward'])}%")
                 else:
                     conditions.append("ward_name LIKE ?")
-                    params.append(f"%{hierarchy['ward']}%")
+                    params.append(f"%{self._normalize_location_text(hierarchy['ward'])}%")
             conditions.append("town_name LIKE ?")
-            params.append(f"%{hierarchy['town']}%")
+            params.append(f"%{self._normalize_location_text(hierarchy['town'])}%")
 
         # フォールバック：addressでの検索
         if not conditions:
+            normalized_location = (
+                self._normalize_location_text(hierarchy.get('prefecture', '')) +
+                self._normalize_location_text(hierarchy.get('city', '')) +
+                self._normalize_location_text(hierarchy.get('ward', '')) +
+                self._normalize_location_text(hierarchy.get('town', ''))
+            )
             conditions.append("address LIKE ?")
-            params.append(f"%{hierarchy.get('prefecture', '') + hierarchy.get('city', '') + hierarchy.get('ward', '') + hierarchy.get('town', '')}%")
+            params.append(f"%{normalized_location}%")
 
         where_clause = " AND ".join(conditions)
         return where_clause, params
@@ -771,9 +911,10 @@ class PropertyAnalysisAgent:
                         if fallback_result_list:
                             fallback_result_list[0]['_total_count'] = fallback_total_count
                             fallback_result_list[0]['_search_method'] = 'address_fallback'
-                        else:
-                            fallback_result_list = [{'_total_count': fallback_total_count, '_search_method': 'address_fallback'}]
+                        # 0件の場合は空のリストを返す（ダミーデータを作成しない）
 
+                        # 重複削除を適用
+                        fallback_result_list = self._remove_duplicates(fallback_result_list)
                         return fallback_result_list
 
                 # 結果を辞書のリストに変換し、総件数を追加
@@ -781,14 +922,62 @@ class PropertyAnalysisAgent:
                 if result_list:
                     result_list[0]['_total_count'] = total_count
                     result_list[0]['_search_method'] = 'hierarchical'
-                else:
-                    result_list = [{'_total_count': total_count, '_search_method': 'hierarchical'}]
+                # 0件の場合は空のリストを返す（ダミーデータを作成しない）
 
+                # 重複削除を適用
+                result_list = self._remove_duplicates(result_list)
                 return result_list
 
         except Exception as e:
             logger.error(f"Hierarchical location search error: {e}")
             return self._legacy_location_search(message)
+
+    def _remove_duplicates(self, results: List[Dict]) -> List[Dict]:
+        """重複物件を削除し、おすすめ度順にソートする"""
+        if not results:
+            return results
+
+        # 重複チェック用のキーとなるフィールド
+        seen = set()
+        unique_results = []
+
+        for result in results:
+            # 重複判定キー：住所、価格、間取り
+            duplicate_key = (
+                result.get("address", ""),
+                result.get("mi_price", ""),
+                result.get("floor_plan", "")
+            )
+
+            if duplicate_key not in seen:
+                seen.add(duplicate_key)
+                # おすすめ度スコアを計算
+                recommendation_score = self.recommendation_scorer.calculate_recommendation_score(result)
+                result['_recommendation_score'] = recommendation_score
+                unique_results.append(result)
+            else:
+                logger.debug(f"Duplicate property filtered: {duplicate_key}")
+
+        # おすすめ度順にソート（スコア高い順）
+        unique_results.sort(key=lambda x: x.get('_recommendation_score', 0), reverse=True)
+
+        # 重複削除後の総件数情報を更新
+        if results and unique_results and '_total_count' in results[0]:
+            # 重複削除後の実際の件数を総件数として設定
+            unique_results[0]['_total_count'] = len(unique_results)
+            if '_search_method' in results[0]:
+                unique_results[0]['_search_method'] = results[0]['_search_method']
+        elif unique_results:
+            # メタデータがない場合は新しく追加
+            unique_results[0]['_total_count'] = len(unique_results)
+            unique_results[0]['_search_method'] = 'duplicate_removed'
+
+        logger.info(f"Duplicate removal and scoring: {len(results)} -> {len(unique_results)} properties")
+        if unique_results:
+            scores = [f"{r.get('_recommendation_score', 0):.1f}" for r in unique_results[:3]]
+            logger.info(f"Top 3 recommendation scores: {scores}")
+
+        return unique_results
 
     def _try_exact_address_search(self, query: str) -> List[Dict]:
         """ユーザー入力をそのまま使用した完全一致検索"""
@@ -820,9 +1009,10 @@ class PropertyAnalysisAgent:
                     if result_list:
                         result_list[0]['_total_count'] = total_count
                         result_list[0]['_search_method'] = 'exact_address'
-                    else:
-                        result_list = [{'_total_count': total_count, '_search_method': 'exact_address'}]
+                    # 0件の場合は空のリストを返す（ダミーデータを作成しない）
 
+                    # 重複削除を適用
+                    result_list = self._remove_duplicates(result_list)
                     return result_list
 
                 return []
@@ -871,6 +1061,8 @@ class PropertyAnalysisAgent:
                         else:
                             result_list = [{'_total_count': total_count}]
 
+                        # 重複削除を適用
+                        result_list = self._remove_duplicates(result_list)
                         return result_list
 
                 except Exception as e:
@@ -994,6 +1186,20 @@ class PropertyAnalysisAgent:
                 response_parts.append(f"{i}. {address} {floor_plan} {price_display}")
 
         response_parts.append(f"")  # 空行
+
+        # 100件を超える場合の絞り込み推奨メッセージ
+        if total_count > 100:
+            response_parts.append(f"【絞り込み推奨】")
+            response_parts.append(f"検索結果が{total_count:,}件と多いため、より具体的な条件での絞り込みをお勧めします。")
+            response_parts.append(f"以下の条件で絞り込んでみてください：")
+            response_parts.append(f"- より具体的な地域名（○○町、○○駅周辺など）")
+            response_parts.append(f"- 価格帯（例：5000万円以下、1億円以下など）")
+            response_parts.append(f"- 間取り（例：3LDK、4LDKなど）")
+            response_parts.append(f"- 築年数（例：築10年以内など）")
+            response_parts.append(f"")
+            response_parts.append(f"もう少し絞り込んでいただけると、より適切な物件をご提案できます。")
+            response_parts.append(f"")  # 空行
+
         response_parts.append(f"以上の情報から、{search_area}には様々な間取りと価格帯の物件が存在していることが分かります。")
 
         return "\n".join(response_parts)

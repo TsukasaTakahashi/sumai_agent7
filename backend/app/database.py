@@ -19,42 +19,34 @@ class DatabaseService:
         logger.info(f"Database path: {self.db_path}")
     
     def _create_tables(self):
-        """必要なテーブルを作成"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            
-            # 物件テーブル
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS properties (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    price INTEGER NOT NULL,
-                    area TEXT NOT NULL,
-                    room_type TEXT NOT NULL,
-                    size_sqm REAL,
-                    station_distance TEXT,
-                    age_years INTEGER,
-                    description TEXT,
-                    image_url TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            # ユーザー検索履歴テーブル
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS search_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT NOT NULL,
-                    search_query TEXT NOT NULL,
-                    search_filters TEXT,
-                    result_count INTEGER,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            conn.commit()
-            logger.info("Database tables created successfully")
+        """既存のデータベースを使用するため、テーブル作成をスキップ"""
+        # BUY_data_integrated テーブルが既に存在するデータベースを使用
+        # 検索履歴テーブルのみ必要に応じて追加
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                # 既存テーブルの確認
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='BUY_data_integrated'")
+                if cursor.fetchone():
+                    logger.info("BUY_data_integrated table found - using existing data")
+                else:
+                    logger.warning("BUY_data_integrated table not found in database")
+
+                # 検索履歴テーブルのみ作成
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS search_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL,
+                        search_query TEXT NOT NULL,
+                        search_filters TEXT,
+                        result_count INTEGER,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                conn.commit()
+                logger.info("Database initialization completed")
+        except Exception as e:
+            logger.error(f"Database initialization failed: {e}")
     
     def test_connection(self) -> Dict[str, any]:
         """データベース接続をテスト"""
@@ -148,48 +140,81 @@ class DatabaseService:
             logger.error(f"Failed to add sample properties: {e}")
             return {"status": "error", "error": str(e)}
     
-    def search_properties(self, 
+    def search_properties(self,
                          area: Optional[str] = None,
                          max_price: Optional[int] = None,
                          room_type: Optional[str] = None,
+                         latitude: Optional[float] = None,
+                         longitude: Optional[float] = None,
+                         radius_km: Optional[float] = None,
                          limit: int = 10) -> List[Dict]:
-        """物件を検索"""
+        """物件を検索（緯度経度検索対応）"""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row  # 辞書形式で結果を取得
                 cursor = conn.cursor()
-                
-                query = "SELECT * FROM properties WHERE 1=1"
+
+                query = "SELECT * FROM BUY_data_integrated WHERE 1=1"
                 params = []
-                
+
                 if area:
-                    query += " AND area LIKE ?"
+                    query += " AND address LIKE ?"
                     params.append(f"%{area}%")
-                
+
                 if max_price:
-                    query += " AND price <= ?"
-                    params.append(max_price)
-                
+                    # 賃料または価格での絞り込み
+                    query += " AND (CAST(rent AS INTEGER) <= ? OR CAST(mi_price AS INTEGER) <= ?)"
+                    params.extend([max_price, max_price])
+
                 if room_type:
-                    query += " AND room_type = ?"
-                    params.append(room_type)
-                
-                query += " ORDER BY created_at DESC LIMIT ?"
+                    query += " AND floor_plan LIKE ?"
+                    params.append(f"%{room_type}%")
+
+                # 緯度経度による距離検索
+                if latitude is not None and longitude is not None and radius_km is not None:
+                    # Haversine公式を使用した距離計算
+                    query += """ AND (
+                        6371 * acos(
+                            cos(radians(?)) * cos(radians(latitude)) *
+                            cos(radians(longitude) - radians(?)) +
+                            sin(radians(?)) * sin(radians(latitude))
+                        )
+                    ) <= ?"""
+                    params.extend([latitude, longitude, latitude, radius_km])
+
+                query += " ORDER BY dt DESC LIMIT ?"
                 params.append(limit)
-                
+
                 cursor.execute(query, params)
                 results = cursor.fetchall()
-                
+
                 # 辞書のリストに変換
                 properties = []
                 for row in results:
                     properties.append(dict(row))
-                
+
                 return properties
-        
+
         except Exception as e:
             logger.error(f"Property search failed: {e}")
             return []
+
+    def search_properties_by_distance(self,
+                                    center_lat: float,
+                                    center_lng: float,
+                                    radius_km: float,
+                                    max_price: Optional[int] = None,
+                                    room_type: Optional[str] = None,
+                                    limit: int = 10) -> List[Dict]:
+        """指定した地点からの距離で物件を検索"""
+        return self.search_properties(
+            latitude=center_lat,
+            longitude=center_lng,
+            radius_km=radius_km,
+            max_price=max_price,
+            room_type=room_type,
+            limit=limit
+        )
     
     def save_search_history(self, session_id: str, search_query: str, search_filters: str, result_count: int):
         """検索履歴を保存"""
@@ -204,6 +229,65 @@ class DatabaseService:
                 logger.info(f"Saved search history for session {session_id}")
         except Exception as e:
             logger.error(f"Failed to save search history: {e}")
+
+    def _normalize_location_text(self, text: str) -> str:
+        """地域名の表記揺れを正規化"""
+        if not text:
+            return text
+
+        # よくある表記揺れを修正
+        normalized = text.replace('ヶ', 'ケ')  # 保土ヶ谷区 → 保土ケ谷区
+        normalized = normalized.replace('が', 'ガ')  # 世田が谷 → 世田ガ谷
+        normalized = normalized.replace('ヴ', 'ブ')  # ヴィラ → ビラ
+
+        return normalized
+
+    def get_filtered_count(self,
+                         area: Optional[str] = None,
+                         max_price: Optional[int] = None,
+                         min_price: Optional[int] = None,
+                         room_type: Optional[str] = None) -> int:
+        """絞り込み条件での物件件数を取得（重複削除適用）"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+
+                # 重複削除を適用した件数クエリ（住所、価格、間取りの組み合わせでDISTINCT）
+                query = "SELECT COUNT(*) FROM (SELECT DISTINCT address, mi_price, floor_plan FROM BUY_data_integrated WHERE 1=1"
+                params = []
+
+                if area:
+                    # テキスト正規化を適用
+                    normalized_area = self._normalize_location_text(area)
+                    query += " AND address LIKE ?"
+                    params.append(f"%{normalized_area}%")
+
+                if max_price:
+                    query += " AND CAST(mi_price AS INTEGER) <= ?"
+                    params.append(max_price)
+
+                if min_price:
+                    query += " AND CAST(mi_price AS INTEGER) >= ?"
+                    params.append(min_price)
+
+                if room_type:
+                    query += " AND floor_plan LIKE ?"
+                    params.append(f"%{room_type}%")
+
+                # 有効な価格データのみ対象
+                query += " AND mi_price IS NOT NULL AND mi_price != '' AND mi_price != '0'"
+                query += ")"  # サブクエリを閉じる
+
+                logger.info(f"Count query (with duplicate removal): {query}, Params: {params}")
+                cursor.execute(query, params)
+                count = cursor.fetchone()[0]
+
+                logger.info(f"Count result after duplicate removal: {count}")
+                return count
+
+        except Exception as e:
+            logger.error(f"Filtered count query failed: {e}")
+            return 0
 
 # グローバルインスタンス
 database_service = DatabaseService()
