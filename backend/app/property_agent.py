@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import logging
+import re
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
 from app.config import DB_PATH
@@ -8,6 +9,14 @@ from app.llm_service import llm_service
 from app.models import AgentResponse
 
 logger = logging.getLogger(__name__)
+
+try:
+    import jageocoder
+    JAGEOCODER_AVAILABLE = True
+    logger.info("jageocoder library loaded successfully - geocoding functionality enabled")
+except ImportError:
+    JAGEOCODER_AVAILABLE = False
+    logger.warning("jageocoder library not installed - geocoding functionality disabled")
 
 class PropertyRecommendationScorer:
     """物件のおすすめ度を計算するクラス（将来的な拡張性を考慮した設計）"""
@@ -110,13 +119,275 @@ class PropertyAnalysisAgent:
         self.db_path = DB_PATH
         self.recommendation_scorer = PropertyRecommendationScorer()
         self.session_data = {}  # セッション毎のデータ保存
-        
+
+    def _detect_address_in_message(self, message: str) -> Optional[str]:
+        """メッセージから住所を検出する（完全な住所のみを対象）"""
+        # メッセージをクリーンアップ
+        cleaned_message = message.strip()
+
+        # 完全な住所パターンのみを検出（都道府県+市区町村+詳細住所）
+        complete_address_patterns = [
+            # 都道府県 + 市区町村 + 町名 + 番地 の完全パターン（「から」「まで」を除外）
+            r'((?:北海道|(?:青森|岩手|宮城|秋田|山形|福島|茨城|栃木|群馬|埼玉|千葉|東京|神奈川|新潟|富山|石川|福井|山梨|長野|岐阜|静岡|愛知|三重|滋賀|京都|大阪|兵庫|奈良|和歌山|鳥取|島根|岡山|広島|山口|徳島|香川|愛媛|高知|福岡|佐賀|長崎|熊本|大分|宮崎|鹿児島|沖縄)(?:県|都|府|道))(?:[^\s]+?(?:市|区|町|村))[^\sから]+?[0-9０-９\-−－]+)(?=から|まで|$|\s)',
+
+            # 東京都特別区の完全パターン
+            r'(東京都[^\s]+区[^\sから]+[0-9０-９\-−－]+)(?=から|まで|$|\s)',
+
+            # 政令指定都市の完全パターン
+            r'((?:札幌|仙台|さいたま|千葉|横浜|川崎|相模原|新潟|静岡|浜松|名古屋|京都|大阪|堺|神戸|奈良|和歌山|岡山|広島|北九州|福岡|熊本)市[^\s]+区[^\sから]+[0-9０-９\-−－]+)(?=から|まで|$|\s)',
+
+            # 部分住所パターン（町名まで、番地なし）
+            r'((?:北海道|(?:青森|岩手|宮城|秋田|山形|福島|茨城|栃木|群馬|埼玉|千葉|東京|神奈川|新潟|富山|石川|福井|山梨|長野|岐阜|静岡|愛知|三重|滋賀|京都|大阪|兵庫|奈良|和歌山|鳥取|島根|岡山|広島|山口|徳島|香川|愛媛|高知|福岡|佐賀|長崎|熊本|大分|宮崎|鹿児島|沖縄)(?:県|都|府|道))(?:[^\s]+?(?:市|区|町|村))[^\sから]+?[町丁目])(?=から|まで|$|\s)',
+
+            # 東京都特別区の部分パターン
+            r'(東京都[^\s]+区[^\sから]+?[町丁目])(?=から|まで|$|\s)',
+
+            # 政令指定都市の部分パターン
+            r'((?:札幌|仙台|さいたま|千葉|横浜|川崎|相模原|新潟|静岡|浜松|名古屋|京都|大阪|堺|神戸|奈良|和歌山|岡山|広島|北九州|福岡|熊本)市[^\s]+区[^\sから]+?[町丁目])(?=から|まで|$|\s)'
+        ]
+
+        for pattern in complete_address_patterns:
+            match = re.search(pattern, cleaned_message)
+            if match:
+                detected_address = match.group(1)
+                if len(detected_address) >= 8:  # より厳格な最小住所長
+                    logger.info(f"Detected complete address: {detected_address}")
+                    return detected_address
+
+        # 完全な住所が検出できない場合はNoneを返す（部分住所では誤検出のリスク）
+        logger.debug(f"No complete address detected in message: {cleaned_message}")
+        return None
+
+    def _geocode_address(self, address: str) -> Optional[Tuple[float, float]]:
+        """住所から緯度経度を取得する"""
+        if not JAGEOCODER_AVAILABLE:
+            logger.warning(f"jageocoder not available - cannot geocode address: {address}")
+            return None
+
+        try:
+            # jagecoderを初期化（必要に応じて）
+            try:
+                jageocoder.init()
+            except Exception as e:
+                logger.warning(f"jageocoder initialization failed: {e}")
+                return None
+
+            # jagecoderを使用して住所をジオコーディング
+            results = jageocoder.search(address)
+
+            if not results:
+                logger.warning(f"No geocoding results for address: {address}")
+                return None
+
+            # jageocoder の結果形式に対応
+            if isinstance(results, dict) and 'candidates' in results:
+                candidates = results['candidates']
+                if not candidates:
+                    logger.warning(f"No candidates in geocoding results for address: {address}")
+                    return None
+
+                # 最初の候補を使用（通常は最も適切な結果）
+                best_result = candidates[0]
+                latitude = best_result['y']
+                longitude = best_result['x']
+
+                logger.info(f"Geocoded '{address}' to lat={latitude}, lng={longitude}")
+                return latitude, longitude
+            else:
+                # 古いjagecoderの形式への対応
+                if isinstance(results, list) and len(results) > 0:
+                    best_result = results[0]
+                    latitude = best_result['y']
+                    longitude = best_result['x']
+
+                    logger.info(f"Geocoded '{address}' to lat={latitude}, lng={longitude}")
+                    return latitude, longitude
+                else:
+                    logger.warning(f"Unexpected result format from jageocoder: {type(results)}")
+                    return None
+
+        except Exception as e:
+            logger.error(f"Geocoding failed for address '{address}': {e}")
+            return None
+
+    def _search_properties_by_distance(self, latitude: float, longitude: float,
+                                     radius_km: float = 0.5, limit: int = 50) -> List[Dict]:
+        """指定した緯度経度から半径内の物件を検索"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+
+                # Haversine公式を使った距離計算SQLクエリ
+                query = """
+                SELECT *,
+                    (6371 * acos(
+                        cos(radians(?)) * cos(radians(latitude)) *
+                        cos(radians(longitude) - radians(?)) +
+                        sin(radians(?)) * sin(radians(latitude))
+                    )) as distance_km
+                FROM BUY_data_integrated
+                WHERE latitude IS NOT NULL
+                    AND longitude IS NOT NULL
+                    AND latitude != ''
+                    AND longitude != ''
+                    AND (6371 * acos(
+                        cos(radians(?)) * cos(radians(latitude)) *
+                        cos(radians(longitude) - radians(?)) +
+                        sin(radians(?)) * sin(radians(latitude))
+                    )) <= ?
+                ORDER BY distance_km ASC
+                LIMIT ?
+                """
+
+                params = [latitude, longitude, latitude, latitude, longitude, latitude, radius_km, limit]
+                cursor.execute(query, params)
+                results = cursor.fetchall()
+
+                # 辞書のリストに変換
+                properties = []
+                for row in results:
+                    property_dict = dict(row)
+                    properties.append(property_dict)
+
+                logger.info(f"Found {len(properties)} properties within {radius_km}km of ({latitude}, {longitude})")
+                return properties
+
+        except Exception as e:
+            logger.error(f"Distance-based property search failed: {e}")
+            return []
+
+    def _detect_area_search_request(self, message: str) -> Optional[str]:
+        """機能１: 地域名検索のリクエストを検出"""
+        # より詳細な地域指定を優先的に検出（長い順に処理）
+        area_search_patterns = [
+            # 詳細な地域名（都道府県+市+区）
+            r'(神奈川県[^\s]*市[^\s]*区)', r'(東京都[^\s]*市[^\s]*区)', r'(千葉県[^\s]*市[^\s]*区)', r'(埼玉県[^\s]*市[^\s]*区)',
+            # 都道府県+市
+            r'(神奈川県[^\s]*市)', r'(東京都[^\s]*市)', r'(千葉県[^\s]*市)', r'(埼玉県[^\s]*市)',
+            # 東京都特別区
+            r'(東京都[^\s]*区)',
+            # 市名のみ（政令指定都市など）
+            r'(横浜市[^\s]*区)', r'(川崎市[^\s]*区)', r'(千葉市[^\s]*区)', r'(さいたま市[^\s]*区)',
+            r'(横浜市)', r'(川崎市)', r'(千葉市)', r'(さいたま市)',
+            # 区名のみ（東京都内の特別区）
+            r'(渋谷区)', r'(新宿区)', r'(世田谷区)', r'(港区)', r'(品川区)',
+            # 都道府県のみ（最後に検索）
+            r'(東京都)', r'(神奈川県)', r'(千葉県)', r'(埼玉県)',
+            # 検索キーワード付き
+            r'([^\s]*区[^\s]*検索)', r'([^\s]*市[^\s]*検索)'
+        ]
+
+        # 最長一致を取得するため、長い順にチェック
+        longest_match = ""
+        for pattern in area_search_patterns:
+            match = re.search(pattern, message)
+            if match:
+                area = match.group(1).replace('検索', '').replace('で', '').strip()
+                if len(area) > len(longest_match):
+                    longest_match = area
+
+        if longest_match:
+            logger.info(f"Detected area search request: {longest_match}")
+            return longest_match
+        return None
+
+    def _extract_search_radius(self, message: str) -> float:
+        """メッセージから検索半径を抽出する（デフォルト0.5km）"""
+        import re
+
+        # 様々な半径表現パターンを検出（長いパターンを先に評価）
+        radius_patterns = [
+            (r'(\d+(?:\.\d+)?)km以内', 'km'),
+            (r'(\d+(?:\.\d+)?)キロ以内', 'km'),
+            (r'(\d+(?:\.\d+)?)キロメートル以内', 'km'),
+            (r'半径(\d+(?:\.\d+)?)km', 'km'),
+            (r'半径(\d+(?:\.\d+)?)キロ', 'km'),
+            (r'(\d+)m以内', 'm'),
+            (r'(\d+)メートル以内', 'm'),
+            (r'半径(\d+)m', 'm'),
+            (r'半径(\d+)メートル', 'm'),
+        ]
+
+        for pattern, unit in radius_patterns:
+            match = re.search(pattern, message)
+            if match:
+                radius_value = float(match.group(1))
+
+                # 単位によってメートル/キロメートルを判定
+                if unit == 'm':
+                    radius_km = radius_value / 1000
+                else:
+                    radius_km = radius_value
+
+                logger.info(f"Detected search radius: {radius_km}km from pattern '{pattern}', unit: {unit}, value: {radius_value}, message: {message}")
+                return radius_km
+
+        # デフォルトは500m = 0.5km
+        return 0.5
+
+    def _search_by_area(self, area: str, limit: int = 50) -> List[Dict]:
+        """機能１: 地域名による物件検索（ヘッダーと同じロジックで総件数も取得）"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+
+                # ヘッダーと同じロジックで総件数を取得（重複削除＋有効な価格データのみ）
+                count_query = """
+                SELECT COUNT(*) FROM (
+                    SELECT DISTINCT address, mi_price, floor_plan
+                    FROM BUY_data_integrated
+                    WHERE address LIKE ?
+                    AND mi_price IS NOT NULL
+                    AND mi_price != ''
+                    AND mi_price != '0'
+                )
+                """
+                cursor.execute(count_query, [f"%{area}%"])
+                total_count = cursor.fetchone()[0]
+
+                # 表示用データを取得（重複削除なしで新着順に表示）
+                query = """
+                SELECT * FROM BUY_data_integrated
+                WHERE address LIKE ?
+                AND mi_price IS NOT NULL
+                AND mi_price != ''
+                AND mi_price != '0'
+                ORDER BY dt DESC
+                LIMIT ?
+                """
+                params = [f"%{area}%", limit]
+
+                cursor.execute(query, params)
+                results = cursor.fetchall()
+
+                # 辞書のリストに変換し、総件数情報を追加
+                properties = []
+                for row in results:
+                    property_dict = dict(row)
+                    properties.append(property_dict)
+
+                # 最初の要素に総件数情報を追加
+                if properties:
+                    properties[0]['_total_count'] = total_count
+                else:
+                    # 結果が0件の場合も総件数を返す
+                    properties = [{'_total_count': total_count}]
+
+                logger.info(f"Found {len(properties)} properties (total: {total_count}, with duplicate removal) for area: {area}")
+                return properties
+
+        except Exception as e:
+            logger.error(f"Area-based property search failed: {e}")
+            return []
+
     async def analyze_query(self, message: str, session_id: str) -> AgentResponse:
         """ユーザーの複雑な問い合わせを分析して適切な検索を実行"""
         try:
             # セッション履歴を取得
             session_context = self._get_session_context(session_id)
-            
+
             # 件数のみの問い合わせかチェック
             if self._is_count_only_query(message):
                 total_count = self._get_total_count()
@@ -131,7 +402,149 @@ class PropertyAnalysisAgent:
                         "total_count": total_count
                     }
                 )
-            
+
+            # 機能１: 地域名検索の検出と処理
+            area_search_request = self._detect_area_search_request(message)
+            if area_search_request and not self._detect_address_in_message(message):
+                logger.info(f"Processing area search request: {area_search_request}")
+
+                # 地域検索を実行
+                area_search_results = self._search_by_area(area_search_request, limit=50)
+
+                if area_search_results:
+                    # 地域検索結果の分析
+                    analysis_results = self._analyze_search_results(
+                        area_search_results,
+                        {"query_type": "area_search"}
+                    )
+
+                    # セッションデータを保存
+                    self._save_session_data(session_id, {
+                        "last_query": message,
+                        "last_search_results": area_search_results,
+                        "last_analysis": analysis_results,
+                        "search_area": area_search_request
+                    })
+
+                    # AI応答生成（地域検索用）
+                    response = await self._generate_area_search_response(
+                        message, area_search_request, area_search_results, analysis_results
+                    )
+
+                    # 物件テーブルデータを生成
+                    property_table_data = []
+                    if area_search_results:
+                        recommended_properties = self._get_recommended_properties(area_search_results, limit=50)
+                        property_table_data = self._format_property_table_data(recommended_properties)
+
+                    return AgentResponse(
+                        agent_name="property_analysis",
+                        response=response,
+                        confidence=0.95,
+                        metadata={
+                            "agent_type": "property_analysis",
+                            "search_count": len(area_search_results),
+                            "query_type": "area_search",
+                            "search_area": area_search_request,
+                            "llm_used": True
+                        },
+                        property_table=property_table_data
+                    )
+
+            # 機能２: 住所検出とジオサーチの試行
+            detected_address = self._detect_address_in_message(message)
+            if detected_address:
+                logger.info(f"Detected address for geocoding: {detected_address}")
+
+                # 住所をジオコーディング
+                coordinates = None
+                if JAGEOCODER_AVAILABLE:
+                    coordinates = self._geocode_address(detected_address)
+
+                # ジオコーディング結果を使用
+                if coordinates:
+                    latitude, longitude = coordinates
+                    logger.info(f"Geocoded '{detected_address}' to lat={latitude}, lng={longitude}")
+
+                    # メッセージから検索半径を抽出
+                    search_radius_km = self._extract_search_radius(message)
+                    logger.info(f"Extracted search radius: {search_radius_km}km")
+
+                    # 指定半径内の物件を検索
+                    geo_search_results = self._search_properties_by_distance(
+                        latitude=latitude,
+                        longitude=longitude,
+                        radius_km=search_radius_km,
+                        limit=50
+                    )
+
+                    if geo_search_results:
+                        # ジオサーチ結果の分析
+                        geo_analysis_results = self._analyze_search_results(
+                            geo_search_results,
+                            {"query_type": "geo_search"}
+                        )
+
+                        # セッションデータを保存
+                        self._save_session_data(session_id, {
+                            "last_query": message,
+                            "last_search_results": geo_search_results,
+                            "last_analysis": geo_analysis_results,
+                            "detected_address": detected_address,
+                            "search_coordinates": {"lat": latitude, "lng": longitude},
+                            "search_radius_km": search_radius_km
+                        })
+
+                        # ジオサーチ専用の応答生成
+                        geo_response = await self._generate_geo_search_response(
+                            message, detected_address, geo_search_results,
+                            geo_analysis_results, latitude, longitude, search_radius_km
+                        )
+
+                        # 物件テーブルデータを生成（距離順）
+                        property_table_data = []
+                        if geo_search_results:
+                            recommended_properties = self._get_recommended_properties(geo_search_results, limit=50)
+                            property_table_data = self._format_property_table_data(recommended_properties)
+
+                        return AgentResponse(
+                            agent_name="property_analysis",
+                            response=geo_response,
+                            confidence=0.95,
+                            metadata={
+                                "agent_type": "property_analysis",
+                                "search_count": len(geo_search_results),
+                                "query_type": "geo_search",
+                                "detected_address": detected_address,
+                                "search_coordinates": {"lat": latitude, "lng": longitude},
+                                "search_radius_km": search_radius_km,
+                                "llm_used": True
+                            },
+                            property_table=property_table_data
+                        )
+                    else:
+                        logger.warning(f"No properties found within 500m of {detected_address}")
+                else:
+                    logger.warning(f"Failed to geocode address: {detected_address}")
+            elif detected_address and not JAGEOCODER_AVAILABLE:
+                logger.warning(f"Address detected but jageocoder not available: {detected_address}")
+                # jagecoderが利用できない場合は地域検索にフォールバック
+                fallback_area = detected_address.split('区')[0] + '区' if '区' in detected_address else detected_address.split('市')[0] + '市' if '市' in detected_address else detected_address.split('都')[0] + '都' if '都' in detected_address else None
+                if fallback_area:
+                    logger.info(f"Falling back to area search: {fallback_area}")
+                    area_search_results = self._search_by_area(fallback_area, limit=50)
+                    if area_search_results:
+                        analysis_results = self._analyze_search_results(area_search_results, {"query_type": "fallback_area_search"})
+                        response = f"{detected_address}の住所検索は現在利用できないため、{fallback_area}での地域検索結果をお見せします。{len(area_search_results)}件の物件が見つかりました。"
+                        property_table_data = self._format_property_table_data(self._get_recommended_properties(area_search_results, limit=50))
+                        return AgentResponse(
+                            agent_name="property_analysis",
+                            response=response,
+                            confidence=0.8,
+                            metadata={"agent_type": "property_analysis", "query_type": "fallback_search"},
+                            property_table=property_table_data
+                        )
+
             # エリア関連クエリの前処理
             location_preprocessing = await self._preprocess_location_query(message, session_context)
             
@@ -609,7 +1022,223 @@ class PropertyAnalysisAgent:
             return self._generate_fallback_response(user_message, search_results, analysis_results, location_preprocessing)
 
         return llm_response
-    
+
+    async def _generate_geo_search_response(self, user_message: str, detected_address: str,
+                                          search_results: List[Dict], analysis_results: Dict,
+                                          latitude: float, longitude: float, radius_km: float = 0.5) -> str:
+        """ジオサーチ結果用の専用AI応答生成"""
+        total_count = analysis_results.get('total_count', 0)
+
+        # 検索結果のサマリーを作成（最初の5件）
+        sample_results = search_results[:5]
+        results_summary = []
+
+        if total_count == 0:
+            results_summary.append("半径{radius_km}km以内に該当する物件が見つかりませんでした")
+        else:
+            for result in sample_results:
+                price = result.get("mi_price", "不明")
+                address = result.get("address", "不明")
+                floor_plan = result.get("floor_plan", "不明")
+                # 距離情報も表示
+                distance = result.get("distance_km")
+                distance_str = f"（約{distance:.1f}km）" if distance else ""
+                results_summary.append(f"・{address} {floor_plan} {price}円 {distance_str}")
+
+        response_prompt = [
+            {
+                "role": "system",
+                "content": f"""あなたは不動産分析の専門家です。
+
+【重要な指示】
+- ユーザーが指定した住所「{detected_address}」から半径{radius_km}km以内での検索結果です
+- 緯度{latitude:.6f}、経度{longitude:.6f}を中心とした検索です
+- 総件数が{total_count}件です。この数字は正確です
+- 距離順（近い順）で並んでいます
+- {total_count}件 = 0 の場合は、「半径{radius_km}km以内に該当する物件が見つかりませんでした」と明確に答えてください
+- {total_count}件 > 0 の場合は、必ず「周辺の物件が見つかりました」と答えてください
+
+【検索条件】
+指定住所: {detected_address}
+検索半径: {radius_km}km
+検索中心: 緯度{latitude:.6f}, 経度{longitude:.6f}
+
+【検索結果データ】
+総件数: {total_count}件
+価格統計: {json.dumps(analysis_results.get('price_stats', {}), ensure_ascii=False)}
+間取り分布: {json.dumps(analysis_results.get('floor_plan_stats', {}), ensure_ascii=False)}
+
+【実際の物件例（距離順・最初の5件）】
+{chr(10).join(results_summary)}
+
+**必須回答形式（UIで読みやすいように改行を含めてください）:**
+
+1. まず指定住所と検索結果の総件数を明記
+2. 検索条件（半径5km）を説明
+3. 価格統計（最安値、最高値、平均価格）を改行して表示
+4. 間取り分布を改行して表示
+5. 物件例を距離順の番号付きリストで改行して表示
+6. 最後に簡潔なまとめ
+
+以下の形式で回答してください：
+
+🏠 **緯度経度検索結果**
+「{detected_address}」から半径{radius_km}km以内の不動産物件検索を実行しました。
+
+【検索条件】
+- 指定住所: {detected_address}
+- 検索半径: {radius_km}km
+- 検索中心座標: 緯度{latitude:.6f}, 経度{longitude:.6f}
+- 検索結果: {total_count}件
+
+【価格・間取り情報】
+- 価格統計: 最安値 X円、最高値 X円、平均価格 X円
+- 主な間取り: 3LDK (X件)、2LDK (X件) など
+
+【近隣物件例（距離順）】
+1. 住所 間取り 価格 （約X.XKm）
+2. 住所 間取り 価格 （約X.XKm）
+...
+
+指定された住所を中心として、半径{radius_km}km以内にある物件を距離の近い順に表示しています。
+ご希望に合う物件がございましたら、詳細をお聞かせください。
+
+**検索タイプ: 地理的検索（ジオサーチ）**
+**検索結果の状態: {"物件あり（距離順）" if total_count > 0 else "該当物件なし"}**
+"""
+            }
+        ]
+
+        response_prompt.append({
+            "role": "user",
+            "content": user_message
+        })
+
+        try:
+            llm_response = await llm_service.get_completion(
+                messages=response_prompt,
+                temperature=0.7
+            )
+
+            # LLMが使えない場合のフォールバック応答
+            if llm_response is None:
+                logger.error("LLM service unavailable for geo-search response, using fallback")
+                return self._generate_geo_fallback_response(detected_address, search_results, total_count, latitude, longitude, radius_km)
+
+            return llm_response
+
+        except Exception as e:
+            logger.error(f"Geo-search response generation failed: {e}")
+            return self._generate_geo_fallback_response(detected_address, search_results, total_count, latitude, longitude, radius_km)
+
+    def _generate_geo_fallback_response(self, detected_address: str, search_results: List[Dict],
+                                       total_count: int, latitude: float, longitude: float, radius_km: float = 0.5) -> str:
+        """ジオサーチ用のフォールバック応答"""
+        if total_count == 0:
+            return f"""「{detected_address}」から半径{radius_km}km以内の物件検索結果
+
+【検索条件】
+- 指定住所: {detected_address}
+- 検索半径: {radius_km}km
+- 総件数: 0件
+
+申し訳ございませんが、指定された住所から半径{radius_km}km以内には対象物件が見つかりませんでした。
+検索範囲を広げるか、別の地域での検索をお試しください。"""
+
+        # 基本統計を計算
+        prices = []
+        floor_plans = {}
+
+        for result in search_results:
+            try:
+                price = int(result.get("mi_price", 0))
+                if price > 0:
+                    prices.append(price)
+
+                floor_plan = result.get("floor_plan", "不明")
+                floor_plans[floor_plan] = floor_plans.get(floor_plan, 0) + 1
+            except:
+                continue
+
+        # 価格統計
+        price_stats = ""
+        if prices:
+            price_stats = f"最安値 {min(prices):,}円、最高値 {max(prices):,}円、平均価格 {sum(prices)//len(prices):,}円"
+        else:
+            price_stats = "価格情報なし"
+
+        # 間取り分布（上位3つ）
+        top_floor_plans = sorted(floor_plans.items(), key=lambda x: x[1], reverse=True)[:3]
+        floor_plan_stats = "、".join([f"{fp} ({count}件)" for fp, count in top_floor_plans])
+
+        # 物件例（最初の5件）
+        property_examples = []
+        for i, result in enumerate(search_results[:5], 1):
+            address = result.get("address", "不明")
+            floor_plan = result.get("floor_plan", "不明")
+            price = result.get("mi_price", "不明")
+            distance = result.get("distance_km")
+            distance_str = f"（約{distance:.1f}km）" if distance else ""
+            property_examples.append(f"{i}. {address} {floor_plan} {price}円 {distance_str}")
+
+        return f"""「{detected_address}」から半径{radius_km}km以内の物件検索結果
+
+【検索条件】
+- 指定住所: {detected_address}
+- 検索半径: {radius_km}km
+- 総件数: {total_count}件
+
+【価格・間取り情報】
+- 価格統計: {price_stats}
+- 主な間取り: {floor_plan_stats}
+
+【近隣物件例（距離順）】
+{chr(10).join(property_examples)}
+
+指定された住所を中心として、半径{radius_km}km以内にある物件を距離の近い順に表示しています。
+ご希望に合う物件がございましたら、詳細をお聞かせください。"""
+
+    async def _generate_area_search_response(self, message: str, search_area: str,
+                                           search_results: List[Dict], analysis_results: Dict) -> str:
+        """機能１: 地域検索用の応答を生成"""
+        try:
+            # 総件数を取得（_total_countから）
+            total_count = analysis_results.get('total_count', len(search_results))
+            display_count = len([prop for prop in search_results if '_total_count' not in prop or prop.get('address')])
+
+            # 物件の例を取得（_total_countエントリを除外）
+            property_examples = []
+            valid_props = [prop for prop in search_results if prop.get('address')]  # 有効な物件のみ
+
+            for i, prop in enumerate(valid_props[:5]):
+                address = prop.get('address', '住所不明')
+                price = prop.get('mi_price', '価格不明')
+                years = prop.get('year', '築年数不明')
+                floor_plan = prop.get('floor_plan', '間取り不明')
+                station_info = prop.get('station_and_access', '駅情報不明')
+
+                try:
+                    price_formatted = f"{int(price):,}万円" if price and price.isdigit() else f"{price}万円"
+                except:
+                    price_formatted = f"{price}万円"
+
+                property_examples.append(f"【{i+1}】{address} | {price_formatted} | 築{years}年 | {floor_plan} | {station_info}")
+
+            return f"""【{search_area}の物件検索結果】
+
+検索エリア: {search_area}
+見つかった物件数: {total_count:,}件（上位{display_count}件を表示）
+
+【おすすめ物件（新着順）】
+{chr(10).join(property_examples)}
+
+{search_area}エリアの物件を新着順に表示しています。
+ご希望の条件（価格帯、間取り、駅徒歩分数など）がございましたら、詳しくお聞かせください。"""
+
+        except Exception as e:
+            logger.error(f"Area search response generation failed: {e}")
+            return f"{search_area}エリアで物件が見つかりました。"
+
     def _normalize_location_text(self, text: str) -> str:
         """地域名の表記揺れを正規化"""
         if not text:

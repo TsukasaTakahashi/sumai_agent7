@@ -1,0 +1,116 @@
+{
+  "total_cases": 9,
+  "passed": 9,
+  "failed": 0,
+  "failed_cases": [],
+  "results": [
+    {
+      "area": "東京",
+      "header_count": 33076,
+      "agent_count": 33076,
+      "raw_counts": {
+        "raw": 60623,
+        "valid_price": 60623,
+        "deduplicated": 33076
+      },
+      "is_consistent": true,
+      "difference": 0
+    },
+    {
+      "area": "神奈川県",
+      "header_count": 30512,
+      "agent_count": 30512,
+      "raw_counts": {
+        "raw": 64955,
+        "valid_price": 64955,
+        "deduplicated": 30512
+      },
+      "is_consistent": true,
+      "difference": 0
+    },
+    {
+      "area": "神奈川",
+      "header_count": 30512,
+      "agent_count": 30512,
+      "raw_counts": {
+        "raw": 64955,
+        "valid_price": 64955,
+        "deduplicated": 30512
+      },
+      "is_consistent": true,
+      "difference": 0
+    },
+    {
+      "area": "東京都中央区",
+      "header_count": 50,
+      "agent_count": 50,
+      "raw_counts": {
+        "raw": 86,
+        "valid_price": 86,
+        "deduplicated": 50
+      },
+      "is_consistent": true,
+      "difference": 0
+    },
+    {
+      "area": "東京都中央区晴海",
+      "header_count": 0,
+      "agent_count": 0,
+      "raw_counts": {
+        "raw": 0,
+        "valid_price": 0,
+        "deduplicated": 0
+      },
+      "is_consistent": true,
+      "difference": 0
+    },
+    {
+      "area": "千葉県船橋市上山町",
+      "header_count": 30,
+      "agent_count": 30,
+      "raw_counts": {
+        "raw": 78,
+        "valid_price": 78,
+        "deduplicated": 30
+      },
+      "is_consistent": true,
+      "difference": 0
+    },
+    {
+      "area": "神奈川県川崎市",
+      "header_count": 3333,
+      "agent_count": 3333,
+      "raw_counts": {
+        "raw": 6529,
+        "valid_price": 6529,
+        "deduplicated": 3333
+      },
+      "is_consistent": true,
+      "difference": 0
+    },
+    {
+      "area": "神奈川県川崎市幸区",
+      "header_count": 275,
+      "agent_count": 275,
+      "raw_counts": {
+        "raw": 495,
+        "valid_price": 495,
+        "deduplicated": 275
+      },
+      "is_consistent": true,
+      "difference": 0
+    },
+    {
+      "area": "神奈川県川崎市幸区幸町",
+      "header_count": 11,
+      "agent_count": 11,
+      "raw_counts": {
+        "raw": 21,
+        "valid_price": 21,
+        "deduplicated": 11
+      },
+      "is_consistent": true,
+      "difference": 0
+    }
+  ]
+}
