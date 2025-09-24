@@ -153,7 +153,13 @@ class PropertyAnalysisAgent:
                 response = await self._generate_ai_response(
                     message, search_results, analysis_results, session_context, location_preprocessing
                 )
-                
+
+                # 物件テーブルデータを生成
+                property_table_data = []
+                if search_results and analysis_results.get('total_count', 0) > 0:
+                    recommended_properties = self._get_recommended_properties(search_results, limit=50)
+                    property_table_data = self._format_property_table_data(recommended_properties)
+
                 return AgentResponse(
                     agent_name="property_analysis",
                     response=response,
@@ -163,7 +169,8 @@ class PropertyAnalysisAgent:
                         "search_count": len(search_results),
                         "query_type": "direct_location_search",
                         "llm_used": True
-                    }
+                    },
+                    property_table=property_table_data
                 )
             
             # 問い合わせ内容を分析（前処理結果を含める）
@@ -187,7 +194,13 @@ class PropertyAnalysisAgent:
             response = await self._generate_ai_response(
                 message, search_results, analysis_results, session_context, location_preprocessing
             )
-            
+
+            # 物件テーブルデータを生成（最大50件まで取得）
+            property_table_data = []
+            if search_results and analysis_results.get('total_count', 0) > 0:
+                recommended_properties = self._get_recommended_properties(search_results, limit=50)
+                property_table_data = self._format_property_table_data(recommended_properties)
+
             return AgentResponse(
                 agent_name="property_analysis",
                 response=response,
@@ -198,7 +211,8 @@ class PropertyAnalysisAgent:
                     "query_type": query_analysis.get("query_type", "complex"),
                     "llm_used": True,
                     "location_correction": location_preprocessing.get("correction_made", False)
-                }
+                },
+                property_table=property_table_data
             )
             
         except Exception as e:
@@ -593,7 +607,7 @@ class PropertyAnalysisAgent:
         if total_count > 0 and ("見当たりませんでした" in llm_response or "見つかりませんでした" in llm_response):
             logger.warning(f"LLM generated incorrect response for {total_count} results, using fallback")
             return self._generate_fallback_response(user_message, search_results, analysis_results, location_preprocessing)
-        
+
         return llm_response
     
     def _normalize_location_text(self, text: str) -> str:
@@ -1123,7 +1137,224 @@ class PropertyAnalysisAgent:
         
         logger.info(f"Fallback query analysis: {analysis}")
         return analysis
-    
+
+    def _get_recommended_properties(self, search_results, limit=10):
+        """おすすめ物件を取得（価格、築年数、間取りを考慮したソート）"""
+        if not search_results:
+            return []
+
+        # メタデータを除外
+        properties = [prop for prop in search_results if '_total_count' not in prop]
+
+        # スコア計算とソート
+        def calculate_score(prop):
+            score = 0
+
+            # 価格スコア（安い方が高スコア、but 極端に安いものは除外）
+            try:
+                price = int(prop.get('mi_price', 0))
+                if 1000000 <= price <= 200000000:  # 100万〜2億円の範囲
+                    # 価格が平均的な範囲内でより安いものを優先
+                    if price <= 50000000:  # 5000万円以下
+                        score += 30
+                    elif price <= 80000000:  # 8000万円以下
+                        score += 20
+                    else:
+                        score += 10
+            except:
+                score -= 10  # 価格不明はペナルティ
+
+            # 築年数スコア（新しい方が高スコア）
+            try:
+                years = int(prop.get('years', 999))
+                if years <= 5:
+                    score += 25
+                elif years <= 10:
+                    score += 20
+                elif years <= 20:
+                    score += 15
+                elif years <= 30:
+                    score += 10
+                else:
+                    score += 5
+            except:
+                score += 5  # 築年数不明は中程度
+
+            # 間取りスコア（人気の間取りを優先）
+            floor_plan = prop.get('floor_plan', '')
+            if '3LDK' in floor_plan or '4LDK' in floor_plan:
+                score += 15
+            elif '2LDK' in floor_plan or '1LDK' in floor_plan:
+                score += 10
+            elif 'LDK' in floor_plan:
+                score += 5
+
+            # 駅情報があるかどうか（traffic1を優先）
+            if prop.get('traffic1') or prop.get('station_name') or prop.get('dp1'):
+                score += 10
+
+            return score
+
+        # スコアでソートして上位を取得
+        properties_with_score = [(prop, calculate_score(prop)) for prop in properties]
+        properties_with_score.sort(key=lambda x: x[1], reverse=True)
+
+        return [prop for prop, score in properties_with_score[:limit]]
+
+    def _extract_station_info_from_traffic(self, traffic1_data):
+        """traffic1フィールドから駅情報を抽出"""
+        if not traffic1_data:
+            return ""
+
+        import json
+        import re
+
+        try:
+            # JSONの配列として解析
+            if isinstance(traffic1_data, str):
+                traffic_list = json.loads(traffic1_data)
+            else:
+                traffic_list = traffic1_data
+
+            if not traffic_list or len(traffic_list) == 0:
+                return ""
+
+            # 最初の交通情報を使用
+            traffic_info = traffic_list[0]
+
+            # パターン1: 「駅名」徒歩X分
+            pattern1 = r'「([^」]+)」徒歩(\d+)分'
+            match1 = re.search(pattern1, traffic_info)
+            if match1:
+                station_name = match1.group(1)
+                walk_time = match1.group(2)
+                return f"{station_name}駅徒歩{walk_time}分"
+
+            # パターン2: 「駅名」バスX分停歩Y分
+            pattern2 = r'「([^」]+)」バス(\d+)分停歩(\d+)分'
+            match2 = re.search(pattern2, traffic_info)
+            if match2:
+                station_name = match2.group(1)
+                bus_time = match2.group(2)
+                walk_time = match2.group(3)
+                return f"{station_name}駅バス{bus_time}分+徒歩{walk_time}分"
+
+            # パターン3: 路線名を含む形式から駅名を抽出
+            pattern3 = r'([^「]*線)?「([^」]+)」'
+            match3 = re.search(pattern3, traffic_info)
+            if match3:
+                station_name = match3.group(2)
+                # 徒歩時間を探す
+                walk_match = re.search(r'徒歩(\d+)分', traffic_info)
+                if walk_match:
+                    walk_time = walk_match.group(1)
+                    return f"{station_name}駅徒歩{walk_time}分"
+                else:
+                    return f"{station_name}駅"
+
+            return ""
+
+        except (json.JSONDecodeError, IndexError, AttributeError) as e:
+            # JSONパースエラーの場合はフォールバック
+            return ""
+
+    def _extract_station_info(self, dp1_text):
+        """dp1フィールドから駅情報を抽出（フォールバック用）"""
+        if not dp1_text:
+            return ""
+
+        import re
+        # 「駅名」徒歩X分 のパターンを抽出
+        station_pattern = r'「([^」]+)駅?」徒歩(\d+)分'
+        match = re.search(station_pattern, dp1_text)
+        if match:
+            station_name = match.group(1)
+            walk_time = match.group(2)
+            return f"{station_name}駅徒歩{walk_time}分"
+
+        # その他のパターンも試す
+        station_pattern2 = r'([^「」\s]+駅).*?徒歩(\d+)分'
+        match2 = re.search(station_pattern2, dp1_text)
+        if match2:
+            station_name = match2.group(1)
+            walk_time = match2.group(2)
+            return f"{station_name}駅徒歩{walk_time}分"
+
+        return ""
+
+    def _format_property_table_data(self, properties):
+        """物件情報を構造化データとして整形"""
+        if not properties:
+            return []
+
+        property_list = []
+
+        for prop in properties:
+            # 住所（短縮）- 都道府県と市を除いて区以降のみ表示
+            address = prop.get('address', '住所不明')
+            import re
+            match = re.search(r'([^都道府県市]+(?:区|町|村).*)', address)
+            if match:
+                address = match.group(1)
+
+            if len(address) > 25:
+                address = address[:22] + "..."
+
+            # 価格
+            try:
+                price = int(prop.get('mi_price', 0))
+                price_display = f"{price//10000:,}万円"
+            except:
+                price_display = "価格不明"
+
+            # 築年数
+            try:
+                years = int(prop.get('years', 0))
+                if years == 0:
+                    years_display = "新築"
+                else:
+                    years_display = f"築{years}年"
+            except:
+                years_display = "築年数不明"
+
+            # 間取り
+            floor_plan = prop.get('floor_plan', '間取り不明')
+
+            # 最寄り駅情報（traffic1を優先）
+            station_info = ""
+
+            # まずtraffic1から抽出を試す
+            traffic1_station = self._extract_station_info_from_traffic(prop.get('traffic1', ''))
+            if traffic1_station:
+                station_info = traffic1_station
+            else:
+                # traffic1がない場合はstation_nameを使用
+                if prop.get('station_name'):
+                    station_info = f"{prop.get('station_name')}駅"
+                else:
+                    # dp1から駅情報を抽出（フォールバック）
+                    dp1_station = self._extract_station_info(prop.get('dp1', ''))
+                    if dp1_station:
+                        station_info = dp1_station
+
+            if not station_info:
+                station_info = "駅情報なし"
+
+            # URL
+            url = prop.get('url', '')
+
+            property_info = {
+                "address": address,
+                "price": price_display,
+                "years": years_display,
+                "floor_plan": floor_plan,
+                "station_info": station_info,
+                "url": url
+            }
+            property_list.append(property_info)
+
+        return property_list
+
     def _generate_fallback_response(self, user_message: str, search_results: List[Dict],
                                    analysis_results: Dict, location_preprocessing: Dict = None) -> str:
         """LLMが使えない場合のフォールバック応答生成"""
@@ -1170,7 +1401,7 @@ class PropertyAnalysisAgent:
             plan_str = "、".join([f"{plan} ({count}件)" for plan, count in top_plans])
             response_parts.append(f"- 主な間取り: {plan_str}")
 
-        # サンプル物件（最初の5件）
+        # おすすめ物件（テキストの物件例は残す）
         if search_results and len(search_results) > 0:
             response_parts.append(f"")  # 空行
             response_parts.append(f"【実際の物件例】")

@@ -63,7 +63,8 @@ async def chat(request: ChatRequest):
             session_id=session_id,
             response=agent_response.response,
             timestamp=ai_message.timestamp,
-            agent_used=agent_response.agent_name
+            agent_used=agent_response.agent_name,
+            property_table=agent_response.property_table
         )
         
     except Exception as e:

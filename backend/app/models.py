@@ -25,12 +25,21 @@ class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
 
+class PropertyInfo(BaseModel):
+    address: str
+    price: str
+    years: str
+    floor_plan: str
+    station_info: str
+    url: Optional[str] = None
+
 class ChatResponse(BaseModel):
     message_id: str
     session_id: str
     response: str
     timestamp: datetime
     agent_used: Optional[str] = None
+    property_table: Optional[List[PropertyInfo]] = None
 
 class FileUploadRequest(BaseModel):
     session_id: Optional[str] = None
@@ -55,6 +64,7 @@ class AgentResponse(BaseModel):
     response: str
     confidence: float
     metadata: Optional[Dict[str, Any]] = None
+    property_table: Optional[List[PropertyInfo]] = None
 
 class ErrorResponse(BaseModel):
     error: str

@@ -1,10 +1,20 @@
 import React, { useState, useRef, useEffect } from 'react';
 
+interface PropertyInfo {
+  address: string;
+  price: string;
+  years: string;
+  floor_plan: string;
+  station_info: string;
+  url?: string;
+}
+
 interface Message {
   id: string;
   role: 'user' | 'assistant';
   content: string;
   agent?: string;
+  property_table?: PropertyInfo[];
 }
 
 interface PropertyCount {
@@ -17,12 +27,132 @@ interface PropertyCount {
   };
 }
 
+// 物件テーブルコンポーネント
+const PropertyTable: React.FC<{
+  properties: PropertyInfo[],
+  displayCount: number,
+  onDisplayCountChange: (count: number) => void
+}> = ({ properties, displayCount, onDisplayCountChange }) => {
+  if (!properties || properties.length === 0) {
+    return null;
+  }
+
+  // 表示件数に応じてデータを制限
+  const displayedProperties = properties.slice(0, displayCount);
+
+  return (
+    <div style={{
+      marginTop: '16px',
+      backgroundColor: '#2d2d2d',
+      borderRadius: '12px',
+      padding: '16px',
+      border: '1px solid #444'
+    }}>
+      <div style={{
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        marginBottom: '12px'
+      }}>
+        <h3 style={{
+          color: '#22c55e',
+          margin: '0',
+          fontSize: '16px',
+          fontWeight: '600'
+        }}>
+          おすすめ物件一覧
+        </h3>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '14px', color: '#888' }}>表示件数:</span>
+          <select
+            value={displayCount}
+            onChange={(e) => onDisplayCountChange(Number(e.target.value))}
+            style={{
+              backgroundColor: '#1a1a2e',
+              color: '#ffffff',
+              border: '1px solid #444',
+              borderRadius: '4px',
+              padding: '4px 8px',
+              fontSize: '14px',
+              outline: 'none'
+            }}
+          >
+            <option value={5}>5件</option>
+            <option value={10}>10件</option>
+            <option value={20}>20件</option>
+            <option value={50}>50件</option>
+          </select>
+        </div>
+      </div>
+
+      <div style={{ overflowX: 'auto' }}>
+        <table style={{
+          width: '100%',
+          borderCollapse: 'collapse',
+          fontSize: '14px',
+          color: '#ffffff'
+        }}>
+          <thead>
+            <tr style={{ borderBottom: '2px solid #444' }}>
+              <th style={{ padding: '8px 12px', textAlign: 'left', color: '#22c55e' }}>住所</th>
+              <th style={{ padding: '8px 12px', textAlign: 'left', color: '#22c55e' }}>価格</th>
+              <th style={{ padding: '8px 12px', textAlign: 'left', color: '#22c55e' }}>築年数</th>
+              <th style={{ padding: '8px 12px', textAlign: 'left', color: '#22c55e' }}>間取り</th>
+              <th style={{ padding: '8px 12px', textAlign: 'left', color: '#22c55e' }}>最寄り駅</th>
+              <th style={{ padding: '8px 12px', textAlign: 'left', color: '#22c55e' }}>詳細</th>
+            </tr>
+          </thead>
+          <tbody>
+            {displayedProperties.map((property, index) => (
+              <tr key={index} style={{
+                borderBottom: '1px solid #444'
+              }}>
+                <td style={{ padding: '8px 12px' }}>{property.address}</td>
+                <td style={{ padding: '8px 12px', fontWeight: '600', color: '#22c55e' }}>{property.price}</td>
+                <td style={{ padding: '8px 12px' }}>{property.years}</td>
+                <td style={{ padding: '8px 12px' }}>{property.floor_plan}</td>
+                <td style={{ padding: '8px 12px' }}>{property.station_info}</td>
+                <td style={{ padding: '8px 12px' }}>
+                  {property.url ? (
+                    <a
+                      href={property.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{
+                        color: '#22c55e',
+                        textDecoration: 'none',
+                        fontSize: '12px',
+                        padding: '4px 8px',
+                        backgroundColor: '#1a1a2e',
+                        borderRadius: '4px',
+                        border: '1px solid #22c55e'
+                      }}
+                    >
+                      詳細を見る
+                    </a>
+                  ) : (
+                    <span style={{ color: '#888', fontSize: '12px' }}>-</span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
+
 export const SimpleChat: React.FC = () => {
   const [message, setMessage] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [propertyCount, setPropertyCount] = useState<PropertyCount | null>(null);
+  const [showPropertyTable, setShowPropertyTable] = useState(false);
+  const [latestPropertyTable, setLatestPropertyTable] = useState<PropertyInfo[] | null>(null);
+  const [displayCount, setDisplayCount] = useState(10);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
@@ -180,11 +310,18 @@ export const SimpleChat: React.FC = () => {
             console.log('Session ID saved:', data.session_id);
           }
 
+          // 物件テーブルデータがあれば保存し、表示状態をリセット
+          if (data.property_table && data.property_table.length > 0) {
+            setLatestPropertyTable(data.property_table);
+            setShowPropertyTable(false); // 新しい検索結果が来たらリセット
+          }
+
           const aiMessage: Message = {
             id: data.message_id,
             role: 'assistant',
             content: data.response,
-            agent: data.agent_used
+            agent: data.agent_used,
+            property_table: data.property_table
           };
           setMessages(prev => [...prev, aiMessage]);
         } else {
@@ -361,7 +498,7 @@ export const SimpleChat: React.FC = () => {
         )}
         
         {isLoading && (
-          <div style={{ 
+          <div style={{
             marginBottom: '16px',
             display: 'flex',
             justifyContent: 'flex-start'
@@ -381,7 +518,18 @@ export const SimpleChat: React.FC = () => {
             </div>
           </div>
         )}
-        
+
+        {/* おすすめ物件テーブル（ボタンで表示切り替え） */}
+        {showPropertyTable && latestPropertyTable && latestPropertyTable.length > 0 && (
+          <div style={{ padding: '0 20px' }}>
+            <PropertyTable
+              properties={latestPropertyTable}
+              displayCount={displayCount}
+              onDisplayCountChange={setDisplayCount}
+            />
+          </div>
+        )}
+
         <div ref={messagesEndRef} />
       </div>
       
@@ -419,10 +567,10 @@ export const SimpleChat: React.FC = () => {
             }}
             rows={1}
           />
-          <button 
-            onClick={handleSend} 
+          <button
+            onClick={handleSend}
             disabled={isLoading || !message.trim()}
-            style={{ 
+            style={{
               padding: '12px 20px',
               borderRadius: '20px',
               border: 'none',
@@ -436,6 +584,26 @@ export const SimpleChat: React.FC = () => {
           >
             {isLoading ? '送信中' : '送信'}
           </button>
+
+          {/* おすすめ物件を表示するボタン */}
+          {latestPropertyTable && latestPropertyTable.length > 0 && (
+            <button
+              onClick={() => setShowPropertyTable(!showPropertyTable)}
+              style={{
+                padding: '12px 16px',
+                borderRadius: '20px',
+                border: '1px solid #22c55e',
+                backgroundColor: showPropertyTable ? '#22c55e' : 'transparent',
+                color: showPropertyTable ? '#ffffff' : '#22c55e',
+                cursor: 'pointer',
+                fontSize: '14px',
+                fontWeight: '600',
+                whiteSpace: 'nowrap'
+              }}
+            >
+              {showPropertyTable ? '物件を非表示' : 'おすすめ物件を表示'}
+            </button>
+          )}
         </div>
       </div>
     </div>
