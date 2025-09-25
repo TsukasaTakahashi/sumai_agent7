@@ -49,7 +49,12 @@ async def chat(request: ChatRequest):
         )
         
         # AI エージェントにメッセージをルーティング
-        agent_response = await ai_agent_service.route_message(request.message, session_id)
+        agent_response = await ai_agent_service.route_message(
+            message=request.message,
+            session_id=session_id,
+            active_function=request.active_function,
+            search_radius=request.search_radius
+        )
         
         # AIレスポンスを保存
         ai_message = chat_service.add_message(

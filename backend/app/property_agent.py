@@ -382,9 +382,16 @@ class PropertyAnalysisAgent:
             logger.error(f"Area-based property search failed: {e}")
             return []
 
-    async def analyze_query(self, message: str, session_id: str) -> AgentResponse:
+    async def analyze_query(self, message: str, session_id: str, active_function: str = None, search_radius: int = 500) -> AgentResponse:
         """ユーザーの複雑な問い合わせを分析して適切な検索を実行"""
         try:
+            # 機能選択に基づく明示的な処理
+            if active_function == 'geo':
+                return await self._handle_geo_search(message, session_id, search_radius)
+            elif active_function == 'area':
+                return await self._handle_area_search(message, session_id)
+
+            # 機能が選択されていない場合は従来の自動判定を使用
             # セッション履歴を取得
             session_context = self._get_session_context(session_id)
 
@@ -403,9 +410,9 @@ class PropertyAnalysisAgent:
                     }
                 )
 
-            # 機能１: 地域名検索の検出と処理
-            area_search_request = self._detect_area_search_request(message)
-            if area_search_request and not self._detect_address_in_message(message):
+            # 機能２: 住所検出とジオサーチの試行（優先）
+            detected_address = self._detect_address_in_message(message)
+            if detected_address:
                 logger.info(f"Processing area search request: {area_search_request}")
 
                 # 地域検索を実行
@@ -1238,6 +1245,172 @@ class PropertyAnalysisAgent:
         except Exception as e:
             logger.error(f"Area search response generation failed: {e}")
             return f"{search_area}エリアで物件が見つかりました。"
+
+    async def _handle_geo_search(self, message: str, session_id: str, search_radius: int) -> AgentResponse:
+        """機能２: 緯度経度検索の専用ハンドラー"""
+        # 住所を検出
+        detected_address = self._detect_address_in_message(message)
+        if not detected_address:
+            return AgentResponse(
+                agent_name="property_analysis",
+                response="申し訳ございませんが、住所が検出できませんでした。「東京都世田谷区玉川1-1-1」のような具体的な住所を入力してください。",
+                confidence=0.3,
+                metadata={"agent_type": "property_analysis", "query_type": "geo_search_error"}
+            )
+
+        logger.info(f"Geo search: detected address '{detected_address}', radius {search_radius}m")
+
+        # ジオコーディング
+        coordinates = None
+        if JAGEOCODER_AVAILABLE:
+            coordinates = self._geocode_address(detected_address)
+
+        if not coordinates:
+            return AgentResponse(
+                agent_name="property_analysis",
+                response="申し訳ございませんが、指定された住所の緯度経度を取得できませんでした。住所を確認してもう一度お試しください。",
+                confidence=0.3,
+                metadata={"agent_type": "property_analysis", "query_type": "geocoding_error"}
+            )
+
+        latitude, longitude = coordinates
+        search_radius_km = search_radius / 1000  # メートルをキロメートルに変換
+
+        # 距離検索を実行
+        geo_search_results = self._search_properties_by_distance(
+            latitude=latitude,
+            longitude=longitude,
+            radius_km=search_radius_km,
+            limit=50
+        )
+
+        if geo_search_results:
+            # 結果の分析
+            geo_analysis_results = self._analyze_search_results(
+                geo_search_results,
+                {"query_type": "geo_search"}
+            )
+
+            # セッションデータを保存
+            self._save_session_data(session_id, {
+                "last_query": message,
+                "last_search_results": geo_search_results,
+                "last_analysis": geo_analysis_results,
+                "detected_address": detected_address,
+                "search_coordinates": {"lat": latitude, "lng": longitude},
+                "search_radius_km": search_radius_km
+            })
+
+            # ジオサーチ応答生成
+            geo_response = await self._generate_geo_search_response(
+                message, detected_address, geo_search_results,
+                geo_analysis_results, latitude, longitude, search_radius_km
+            )
+
+            # 物件テーブルデータを生成
+            property_table_data = []
+            if geo_search_results:
+                recommended_properties = self._get_recommended_properties(geo_search_results, limit=50)
+                property_table_data = self._format_property_table_data(recommended_properties)
+
+            return AgentResponse(
+                agent_name="property_analysis",
+                response=geo_response,
+                confidence=0.95,
+                metadata={
+                    "agent_type": "property_analysis",
+                    "search_count": len(geo_search_results),
+                    "query_type": "geo_search",
+                    "detected_address": detected_address,
+                    "search_coordinates": {"lat": latitude, "lng": longitude},
+                    "search_radius_km": search_radius_km,
+                    "llm_used": True
+                },
+                property_table=property_table_data
+            )
+        else:
+            return AgentResponse(
+                agent_name="property_analysis",
+                response=f"申し訳ございませんが、「{detected_address}」から半径{search_radius}m以内には物件が見つかりませんでした。検索範囲を広げるか、別の地域での検索をお試しください。",
+                confidence=0.8,
+                metadata={
+                    "agent_type": "property_analysis",
+                    "search_count": 0,
+                    "query_type": "geo_search_no_results",
+                    "detected_address": detected_address,
+                    "search_coordinates": {"lat": latitude, "lng": longitude},
+                    "search_radius_km": search_radius_km
+                }
+            )
+
+    async def _handle_area_search(self, message: str, session_id: str) -> AgentResponse:
+        """機能１: 地域名検索の専用ハンドラー"""
+        # 地域名を検出
+        area_search_request = self._detect_area_search_request(message)
+        if not area_search_request:
+            return AgentResponse(
+                agent_name="property_analysis",
+                response="申し訳ございませんが、地域名が検出できませんでした。「東京都」「神奈川県川崎市」のような地域名を入力してください。",
+                confidence=0.3,
+                metadata={"agent_type": "property_analysis", "query_type": "area_search_error"}
+            )
+
+        logger.info(f"Area search: detected area '{area_search_request}'")
+
+        # 地域検索を実行
+        area_search_results = self._search_by_area(area_search_request, limit=50)
+
+        if area_search_results:
+            # 結果の分析
+            analysis_results = self._analyze_search_results(
+                area_search_results,
+                {"query_type": "area_search"}
+            )
+
+            # セッションデータを保存
+            self._save_session_data(session_id, {
+                "last_query": message,
+                "last_search_results": area_search_results,
+                "last_analysis": analysis_results,
+                "search_area": area_search_request
+            })
+
+            # AI応答生成（地域検索用）
+            response = await self._generate_area_search_response(
+                message, area_search_request, area_search_results, analysis_results
+            )
+
+            # 物件テーブルデータを生成
+            property_table_data = []
+            if area_search_results:
+                recommended_properties = self._get_recommended_properties(area_search_results, limit=50)
+                property_table_data = self._format_property_table_data(recommended_properties)
+
+            return AgentResponse(
+                agent_name="property_analysis",
+                response=response,
+                confidence=0.95,
+                metadata={
+                    "agent_type": "property_analysis",
+                    "search_count": len(area_search_results),
+                    "query_type": "area_search",
+                    "search_area": area_search_request,
+                    "llm_used": True
+                },
+                property_table=property_table_data
+            )
+        else:
+            return AgentResponse(
+                agent_name="property_analysis",
+                response=f"申し訳ございませんが、「{area_search_request}」では物件が見つかりませんでした。別の地域名をお試しください。",
+                confidence=0.8,
+                metadata={
+                    "agent_type": "property_analysis",
+                    "search_count": 0,
+                    "query_type": "area_search_no_results",
+                    "search_area": area_search_request
+                }
+            )
 
     def _normalize_location_text(self, text: str) -> str:
         """地域名の表記揺れを正規化"""

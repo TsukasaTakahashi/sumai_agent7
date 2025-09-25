@@ -60,7 +60,7 @@ class AIAgentService:
             "general": self._general_agent
         }
     
-    async def route_message(self, message: str, session_id: str) -> AgentResponse:
+    async def route_message(self, message: str, session_id: str, active_function: str = None, search_radius: int = 500) -> AgentResponse:
         # 高度なルーティングロジック
         message_lower = message.lower()
         
@@ -92,7 +92,7 @@ class AIAgentService:
         ]
         
         if any(complex_patterns):
-            return await self.agents["property_analysis"](message, session_id)
+            return await self._property_analysis_agent(message, session_id, active_function, search_radius)
         elif any(keyword in message_lower for keyword in ["物件", "不動産", "検索", "探す"]):
             return await self.agents["property_search"](message, session_id)
         elif any(keyword in message_lower for keyword in ["おすすめ", "推薦", "提案"]):
@@ -156,10 +156,10 @@ class AIAgentService:
                 metadata={"agent_type": "recommendation", "llm_used": False, "fallback": True}
             )
     
-    async def _property_analysis_agent(self, message: str, session_id: str) -> AgentResponse:
+    async def _property_analysis_agent(self, message: str, session_id: str, active_function: str = None, search_radius: int = 500) -> AgentResponse:
         """複雑な価格・住所分析エージェント"""
         try:
-            return await property_analysis_agent.analyze_query(message, session_id)
+            return await property_analysis_agent.analyze_query(message, session_id, active_function, search_radius)
         except Exception as e:
             logger.error(f"Property analysis agent error: {e}")
             return AgentResponse(
