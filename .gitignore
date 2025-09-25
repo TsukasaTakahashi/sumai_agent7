@@ -14,4 +14,4 @@ frontend/dist/
 # OS files
 .DS_Store
 .env
-*.log
+*.logbackend/data/properties_with_geocoding.db
