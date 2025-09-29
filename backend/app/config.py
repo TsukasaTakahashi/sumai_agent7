@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 
 # ログ設定
 logging.basicConfig(level=logging.INFO)
+# property_agentのログレベルをDEBUGに設定
+logging.getLogger('app.property_agent').setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # .env ファイルの読み込み（存在しなければ .env.example を使用）
@@ -24,7 +26,7 @@ load_dotenv(env_file)
 
 # 設定値
 OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY")
-DB_PATH: str = os.getenv("DB_PATH", "./data/props.db")
+DB_PATH: str = os.getenv("DB_PATH", "./data/properties_with_geocoding.db")
 TZ: str = os.getenv("TZ", "Asia/Tokyo")
 
 # 設定ログ出力（API_KEYは伏せる）

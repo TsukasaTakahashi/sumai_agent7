@@ -153,6 +153,8 @@ export const SimpleChat: React.FC = () => {
   const [showPropertyTable, setShowPropertyTable] = useState(false);
   const [latestPropertyTable, setLatestPropertyTable] = useState<PropertyInfo[] | null>(null);
   const [displayCount, setDisplayCount] = useState(10);
+  const [activeFunction, setActiveFunction] = useState<string | null>(null);
+  const [searchRadius, setSearchRadius] = useState<number>(500);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
@@ -176,7 +178,7 @@ export const SimpleChat: React.FC = () => {
       if (filters.min_price) params.append('min_price', filters.min_price.toString());
       if (filters.room_type) params.append('room_type', filters.room_type);
 
-      const response = await fetch(`http://127.0.0.1:8000/properties/count?${params}`);
+      const response = await fetch(`http://127.0.0.1:8001/properties/count?${params}`);
       if (response.ok) {
         const data = await response.json();
         setPropertyCount(data);
@@ -258,20 +260,28 @@ export const SimpleChat: React.FC = () => {
 
   const handleSend = async () => {
     if (message.trim()) {
-      const userMessage = message;
+      let userMessage = message;
 
-      // メッセージから地域情報を抽出
-      const extractedArea = extractAreaFromMessage(userMessage);
-      console.log('Extracted area:', extractedArea);
+      // 機能２（緯度経度検索）が選択されている場合、半径情報を追加
+      if (activeFunction === 'geo') {
+        userMessage += ` ${searchRadius}m以内の物件を検索してください`;
+      }
 
-      // 地域関連の処理
-      if (extractedArea !== null) {
-        if (extractedArea === '') {
-          // 空文字列の場合は全国にリセット
-          await fetchPropertyCount({});
-        } else {
-          // 地域が指定された場合、その地域で絞り込み（前の条件をクリア）
-          await fetchPropertyCount({ area: extractedArea });
+      // 機能２（geocoding search）以外の場合のみ地域抽出処理を実行
+      if (activeFunction !== 'geo') {
+        // メッセージから地域情報を抽出
+        const extractedArea = extractAreaFromMessage(userMessage);
+        console.log('Extracted area:', extractedArea);
+
+        // 地域関連の処理
+        if (extractedArea !== null) {
+          if (extractedArea === '') {
+            // 空文字列の場合は全国にリセット
+            await fetchPropertyCount({});
+          } else {
+            // 地域が指定された場合、その地域で絞り込み（前の条件をクリア）
+            await fetchPropertyCount({ area: extractedArea });
+          }
         }
       }
 
@@ -286,13 +296,16 @@ export const SimpleChat: React.FC = () => {
       setIsLoading(true);
 
       try {
-        const requestBody = sessionId
-          ? { message: userMessage, session_id: sessionId }
-          : { message: userMessage };
+        const requestBody = {
+          message: userMessage,
+          ...(sessionId && { session_id: sessionId }),
+          ...(activeFunction && { active_function: activeFunction }),
+          search_radius: searchRadius
+        };
 
         console.log('Sending request:', requestBody);
 
-        const response = await fetch('http://127.0.0.1:8000/chat', {
+        const response = await fetch('http://127.0.0.1:8001/chat', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -314,6 +327,26 @@ export const SimpleChat: React.FC = () => {
           if (data.property_table && data.property_table.length > 0) {
             setLatestPropertyTable(data.property_table);
             setShowPropertyTable(false); // 新しい検索結果が来たらリセット
+          }
+
+          // 機能２（geocoding search）の場合、レスポンスから件数を抽出してヘッダーに反映
+          if (activeFunction === 'geo' && data.response) {
+            const countMatch = data.response.match(/検索結果:\s*(\d+)件/);
+            const radiusMatch = data.response.match(/検索半径:\s*([\d.]+)km/);
+            const addressMatch = data.response.match(/指定住所:\s*([^\\n]+)/);
+
+            if (countMatch) {
+              const count = parseInt(countMatch[1]);
+              const radius = radiusMatch ? parseFloat(radiusMatch[1]) : (searchRadius / 1000);
+              const address = addressMatch ? addressMatch[1] : '指定住所';
+
+              setPropertyCount({
+                count: count,
+                filters: {
+                  area: `${address} 半径${radius}km以内`
+                }
+              });
+            }
           }
 
           const aiMessage: Message = {
@@ -539,8 +572,97 @@ export const SimpleChat: React.FC = () => {
         borderTop: '1px solid #333',
         backgroundColor: '#16213e'
       }}>
-        <div style={{ 
-          display: 'flex', 
+        {/* 機能選択ボタン */}
+        <div style={{
+          display: 'flex',
+          gap: '8px',
+          marginBottom: '12px',
+          maxWidth: '800px',
+          margin: '0 auto',
+          justifyContent: 'center'
+        }}>
+          <button
+            onClick={() => setActiveFunction(activeFunction === 'area' ? null : 'area')}
+            style={{
+              padding: '8px 16px',
+              borderRadius: '16px',
+              border: '1px solid #22c55e',
+              backgroundColor: activeFunction === 'area' ? '#22c55e' : 'transparent',
+              color: activeFunction === 'area' ? '#ffffff' : '#22c55e',
+              cursor: 'pointer',
+              fontSize: '14px',
+              fontWeight: '500'
+            }}
+          >
+            機能１: 地域名検索
+          </button>
+          <button
+            onClick={() => setActiveFunction(activeFunction === 'geo' ? null : 'geo')}
+            style={{
+              padding: '8px 16px',
+              borderRadius: '16px',
+              border: '1px solid #3b82f6',
+              backgroundColor: activeFunction === 'geo' ? '#3b82f6' : 'transparent',
+              color: activeFunction === 'geo' ? '#ffffff' : '#3b82f6',
+              cursor: 'pointer',
+              fontSize: '14px',
+              fontWeight: '500'
+            }}
+          >
+            機能２: 緯度経度検索
+          </button>
+          <button
+            onClick={() => setActiveFunction(activeFunction === 'advanced' ? null : 'advanced')}
+            style={{
+              padding: '8px 16px',
+              borderRadius: '16px',
+              border: '1px solid #8b5cf6',
+              backgroundColor: activeFunction === 'advanced' ? '#8b5cf6' : 'transparent',
+              color: activeFunction === 'advanced' ? '#ffffff' : '#8b5cf6',
+              cursor: 'pointer',
+              fontSize: '14px',
+              fontWeight: '500'
+            }}
+          >
+            機能３: 高度な検索
+          </button>
+        </div>
+
+        {/* 半径選択（機能２選択時のみ表示） */}
+        {activeFunction === 'geo' && (
+          <div style={{
+            marginBottom: '12px',
+            maxWidth: '800px',
+            margin: '0 auto 12px auto',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px',
+            justifyContent: 'center'
+          }}>
+            <label style={{ color: '#ffffff', fontSize: '14px' }}>検索半径:</label>
+            <select
+              value={searchRadius}
+              onChange={(e) => setSearchRadius(Number(e.target.value))}
+              style={{
+                padding: '4px 8px',
+                borderRadius: '8px',
+                border: '1px solid #444',
+                backgroundColor: '#2d2d2d',
+                color: '#ffffff',
+                fontSize: '14px'
+              }}
+            >
+              <option value={100}>100m</option>
+              <option value={500}>500m</option>
+              <option value={1000}>1km</option>
+              <option value={2000}>2km</option>
+              <option value={5000}>5km</option>
+            </select>
+          </div>
+        )}
+
+        <div style={{
+          display: 'flex',
           gap: '12px',
           alignItems: 'flex-end',
           maxWidth: '800px',

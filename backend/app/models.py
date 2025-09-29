@@ -24,6 +24,8 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
+    active_function: Optional[str] = None  # 'area', 'geo', 'advanced'
+    search_radius: Optional[int] = 500  # meters
 
 class PropertyInfo(BaseModel):
     address: str

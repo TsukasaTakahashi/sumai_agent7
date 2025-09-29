@@ -1,6 +1,6 @@
 import { ChatRequest, ChatResponse, FileUploadResponse, ChatMessage } from '../types/chat';
 
-const API_BASE_URL = 'http://127.0.0.1:8000';
+const API_BASE_URL = 'http://127.0.0.1:8001';
 
 export const chatApi = {
   async sendMessage(request: ChatRequest): Promise<ChatResponse> {

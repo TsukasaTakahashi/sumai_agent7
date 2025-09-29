@@ -49,7 +49,12 @@ async def chat(request: ChatRequest):
         )
         
         # AI エージェントにメッセージをルーティング
-        agent_response = await ai_agent_service.route_message(request.message, session_id)
+        agent_response = await ai_agent_service.route_message(
+            message=request.message,
+            session_id=session_id,
+            active_function=request.active_function,
+            search_radius=request.search_radius
+        )
         
         # AIレスポンスを保存
         ai_message = chat_service.add_message(
@@ -189,14 +194,30 @@ async def search_properties_by_location(
 ):
     """指定した地点からの距離で物件を検索"""
     try:
+        # より多くのデータを取得（重複削除分を考慮）
+        fetch_limit = min(limit * 3, 500)  # 重複削除後にlimit件確保するため
+
         properties = database_service.search_properties_by_distance(
             center_lat=lat,
             center_lng=lng,
             radius_km=radius_km,
             max_price=max_price,
             room_type=room_type,
-            limit=limit
+            limit=fetch_limit
         )
+
+        # 重複削除を適用
+        from app.property_agent import PropertyAnalysisAgent
+        agent = PropertyAnalysisAgent()
+        if properties:
+            properties, dedup_stats = agent._remove_duplicates(properties)
+            # limitに制限
+            properties = properties[:limit]
+
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"Geo search duplicate removal: {fetch_limit} fetched -> {len(properties)} returned (after dedup and limit)")
+
         return {
             "properties": properties,
             "count": len(properties),
@@ -292,4 +313,4 @@ async def get_database_stats():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8002)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
