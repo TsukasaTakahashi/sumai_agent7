@@ -1276,12 +1276,22 @@ class PropertyAnalysisAgent:
         latitude, longitude = coordinates
         search_radius_km = search_radius / 1000  # メートルをキロメートルに変換
 
-        # 距離検索を実行
+        # 距離検索を実行（半径に応じた適切な件数制限を設定）
+        # 半径が小さい場合は少なく、大きい場合は多く取得
+        if search_radius_km <= 0.5:
+            limit = 100  # 500m以内は100件まで
+        elif search_radius_km <= 1.0:
+            limit = 200  # 1km以内は200件まで
+        elif search_radius_km <= 2.0:
+            limit = 300  # 2km以内は300件まで
+        else:
+            limit = 500  # それ以上は500件まで
+
         geo_search_results = self._search_properties_by_distance(
             latitude=latitude,
             longitude=longitude,
             radius_km=search_radius_km,
-            limit=50
+            limit=limit
         )
 
         if geo_search_results:

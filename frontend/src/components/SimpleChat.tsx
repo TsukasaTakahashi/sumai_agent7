@@ -267,18 +267,21 @@ export const SimpleChat: React.FC = () => {
         userMessage += ` ${searchRadius}m以内の物件を検索してください`;
       }
 
-      // メッセージから地域情報を抽出
-      const extractedArea = extractAreaFromMessage(userMessage);
-      console.log('Extracted area:', extractedArea);
+      // 機能２（geocoding search）以外の場合のみ地域抽出処理を実行
+      if (activeFunction !== 'geo') {
+        // メッセージから地域情報を抽出
+        const extractedArea = extractAreaFromMessage(userMessage);
+        console.log('Extracted area:', extractedArea);
 
-      // 地域関連の処理
-      if (extractedArea !== null) {
-        if (extractedArea === '') {
-          // 空文字列の場合は全国にリセット
-          await fetchPropertyCount({});
-        } else {
-          // 地域が指定された場合、その地域で絞り込み（前の条件をクリア）
-          await fetchPropertyCount({ area: extractedArea });
+        // 地域関連の処理
+        if (extractedArea !== null) {
+          if (extractedArea === '') {
+            // 空文字列の場合は全国にリセット
+            await fetchPropertyCount({});
+          } else {
+            // 地域が指定された場合、その地域で絞り込み（前の条件をクリア）
+            await fetchPropertyCount({ area: extractedArea });
+          }
         }
       }
 
@@ -324,6 +327,26 @@ export const SimpleChat: React.FC = () => {
           if (data.property_table && data.property_table.length > 0) {
             setLatestPropertyTable(data.property_table);
             setShowPropertyTable(false); // 新しい検索結果が来たらリセット
+          }
+
+          // 機能２（geocoding search）の場合、レスポンスから件数を抽出してヘッダーに反映
+          if (activeFunction === 'geo' && data.response) {
+            const countMatch = data.response.match(/検索結果:\s*(\d+)件/);
+            const radiusMatch = data.response.match(/検索半径:\s*([\d.]+)km/);
+            const addressMatch = data.response.match(/指定住所:\s*([^\\n]+)/);
+
+            if (countMatch) {
+              const count = parseInt(countMatch[1]);
+              const radius = radiusMatch ? parseFloat(radiusMatch[1]) : (searchRadius / 1000);
+              const address = addressMatch ? addressMatch[1] : '指定住所';
+
+              setPropertyCount({
+                count: count,
+                filters: {
+                  area: `${address} 半径${radius}km以内`
+                }
+              });
+            }
           }
 
           const aiMessage: Message = {
